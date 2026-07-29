@@ -3419,10 +3419,13 @@ appendFileSync(${JSON.stringify(keyLog)}, apiKey.trim() + "\\n");
       `
 const args = process.argv.slice(2).join(" ");
 if (args === "login --with-api-key") {
-  process.exit(0);
+  let apiKey = "";
+  for await (const chunk of process.stdin) apiKey += chunk;
+  if (!["secret-key", "ambient-key"].includes(apiKey.trim())) {
+    process.exitCode = 3;
+  }
 } else if (args === "login") {
   console.error("Open https://auth.example.test/login");
-  process.exit(0);
 } else {
   process.exitCode = 2;
 }
@@ -3472,16 +3475,19 @@ if (args === "login --with-api-key") {
         },
       },
     );
-    await client.loginApiKey("secret-key");
-    const login = await client.loginChatGPT();
-    await expect(login.wait()).resolves.toMatchObject({ success: true });
-    await client.run(repository);
-    expect((codexOptions as CodexOptions | null)?.apiKey).toBeUndefined();
-    expect((codexOptions as CodexOptions | null)?.env).toMatchObject({
-      OPENAI_API_KEY: "ambient-key",
-      CODEX_API_KEY: "secondary-ambient-key",
-    });
-    await client.close();
+    try {
+      await client.loginApiKey("secret-key");
+      const login = await client.loginChatGPT();
+      await expect(login.wait()).resolves.toMatchObject({ success: true });
+      await client.run(repository);
+      expect((codexOptions as CodexOptions | null)?.apiKey).toBeUndefined();
+      expect((codexOptions as CodexOptions | null)?.env).toMatchObject({
+        OPENAI_API_KEY: "ambient-key",
+        CODEX_API_KEY: "secondary-ambient-key",
+      });
+    } finally {
+      await client.close();
+    }
   });
 
   test("aborts and waits for an in-flight API-key login during close", async () => {
