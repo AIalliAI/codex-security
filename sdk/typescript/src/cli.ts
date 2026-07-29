@@ -1433,11 +1433,7 @@ export async function main(
               "To use a ChatGPT sign-in, unset OPENAI_API_KEY and CODEX_API_KEY.\n",
             );
           }
-        } else if (
-          exitCode === 0 &&
-          !options.withApiKey &&
-          !options.withAccessToken
-        ) {
+        } else if (exitCode === 0 && !options.withApiKey) {
           const authentication = scanAuthentication(dependencies.environment);
           if (authentication.method === "api_key") {
             const configuredApiKeyVariables = Object.entries(
@@ -1450,10 +1446,16 @@ export async function main(
                     name.toUpperCase() === "CODEX_API_KEY"),
               )
               .map(([name]) => name);
+            const loginKind = options.withAccessToken
+              ? "Access-token"
+              : "ChatGPT";
+            const credential = options.withAccessToken
+              ? "access token"
+              : "ChatGPT sign-in";
             errorOutput.write(
-              "ChatGPT login succeeded. Interactive scans will ask which account to use; " +
+              `${loginKind} login succeeded. Interactive scans will ask which account to use; ` +
                 `noninteractive scans will use ${authentication.source}.\n` +
-                "To use your ChatGPT sign-in, pass '--auth chatgpt' or run " +
+                `To use your ${credential}, pass '--auth chatgpt' or run ` +
                 `'unset ${configuredApiKeyVariables.join(" ")}'.\n`,
             );
           }
