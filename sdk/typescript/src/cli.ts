@@ -1446,16 +1446,16 @@ export async function main(
                     name.toUpperCase() === "CODEX_API_KEY"),
               )
               .map(([name]) => name);
-            const loginKind = options.withAccessToken
-              ? "Access-token"
-              : "ChatGPT";
-            const credential = options.withAccessToken
-              ? "access token"
-              : "ChatGPT sign-in";
+            const loginWarning = options.withAccessToken
+              ? `Access-token login succeeded, but noninteractive scans will use ${authentication.source}.\n`
+              : "ChatGPT login succeeded. Interactive scans will ask which account to use; " +
+                `noninteractive scans will use ${authentication.source}.\n`;
+            const storedCredentials = options.withAccessToken
+              ? "your stored credentials"
+              : "your ChatGPT sign-in";
             errorOutput.write(
-              `${loginKind} login succeeded. Interactive scans will ask which account to use; ` +
-                `noninteractive scans will use ${authentication.source}.\n` +
-                `To use your ${credential}, pass '--auth chatgpt' or run ` +
+              loginWarning +
+                `To use ${storedCredentials}, pass '--auth chatgpt' or run ` +
                 `'unset ${configuredApiKeyVariables.join(" ")}'.\n`,
             );
           }

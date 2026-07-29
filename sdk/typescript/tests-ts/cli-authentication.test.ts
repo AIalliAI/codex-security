@@ -119,7 +119,7 @@ describe("CLI authentication", () => {
     }
   });
 
-  test("explains when an environment API key overrides an access-token login", async () => {
+  test("warns when an environment API key overrides a successful access-token login", async () => {
     for (const [environment, source, unsetCommand] of [
       [
         { OPENAI_API_KEY: "sk-proj-SYNTHETIC_SECRET_123" },
@@ -153,13 +153,13 @@ describe("CLI authentication", () => {
       ).toBe(0);
       expect(stdout.text()).toBe("");
       expect(stderr.text()).toContain(
-        "Access-token login succeeded. Interactive scans will ask which account to use;",
+        `Access-token login succeeded, but noninteractive scans will use ${source}.`,
       );
       expect(stderr.text()).toContain(
-        `noninteractive scans will use ${source}.`,
+        "To use your stored credentials, pass '--auth chatgpt' or run ",
       );
-      expect(stderr.text()).toContain("--auth chatgpt");
       expect(stderr.text()).toContain(`'${unsetCommand}'`);
+      expect(stderr.text()).not.toContain("ChatGPT login succeeded");
       expect(stderr.text()).not.toContain("SYNTHETIC_SECRET");
     }
   });
@@ -186,6 +186,22 @@ describe("CLI authentication", () => {
       expect(stderr.text()).not.toContain("Access-token login succeeded");
       expect(stderr.text()).not.toContain("synthetic-private-key");
     }
+  });
+
+  test("does not warn after access-token login without an overriding API key", async () => {
+    const stdout = capture();
+    const stderr = capture();
+
+    expect(
+      await main(
+        ["login", "--with-access-token"],
+        stdout.stream,
+        stderr.stream,
+        dependencies({ environment: {} }),
+      ),
+    ).toBe(0);
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).toBe("");
   });
 
   test("forwards explicit and automatic scan authentication selection", async () => {
