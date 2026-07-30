@@ -9,6 +9,7 @@ on:
       - Dockerfile
       - Dockerfile.dockerignore
       - compose.yaml
+      - compose.apparmor.yaml
       - docker/**
       - sdk/typescript/**
   pull_request:
@@ -18,6 +19,7 @@ on:
       - Dockerfile
       - Dockerfile.dockerignore
       - compose.yaml
+      - compose.apparmor.yaml
       - docker/**
       - sdk/typescript/**
   workflow_dispatch:
@@ -104,6 +106,11 @@ jobs:
           export CODEX_SECURITY_USER
           docker compose config --quiet
           docker compose run --rm codex-security --version
+
+      - name: Validate optional AppArmor Compose configuration
+        env:
+          CODEX_SECURITY_IMAGE: codex-security:ci
+        run: docker compose -f compose.yaml -f compose.apparmor.yaml config --quiet
 
       - name: Verify hardened Codex command sandbox
         shell: bash
