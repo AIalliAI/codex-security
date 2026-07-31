@@ -567,6 +567,7 @@ export async function validateOutputDir(
         );
       }
       requirePrivateOutputDirectory(metadata, path);
+      await requireSecureOutputAncestry(path);
       const canonical = await realpath(path);
       requireModelSafeOutputDir(canonical);
       return canonical;
@@ -581,6 +582,7 @@ export async function validateOutputDir(
             relative(parent, path),
           );
           requireModelSafeOutputDir(canonical);
+          await requireSecureOutputAncestry(canonical);
           return canonical;
         }
         break;
@@ -704,6 +706,7 @@ export async function validatePreparedOutputDir(
     );
   }
   requirePrivateOutputDirectory(metadata, path);
+  await requireSecureOutputAncestry(canonical);
   return canonical;
 }
 
@@ -721,6 +724,78 @@ export function requirePrivateOutputDirectory(
   if (effectiveUid !== undefined && metadata.uid !== effectiveUid) {
     throw new OutputDirectoryError(
       `Scan output directory must be owned by the current user: ${path}`,
+    );
+  }
+}
+
+/** Reject shared parents whose owner can rename or replace private scan output. */
+export async function requireSecureOutputAncestry(
+  path: string,
+  effectiveUid = process.geteuid?.(),
+): Promise<void> {
+  if (process.platform === "win32") return;
+  let current = dirname(resolve(path));
+  while (true) {
+    try {
+      current = await realpath(current);
+      break;
+    } catch (error) {
+      if (nodeErrorCode(error) !== "ENOENT") {
+        throw new OutputDirectoryError(
+          `Unable to inspect scan output parent directory: ${current}`,
+          { cause: error },
+        );
+      }
+      const parent = dirname(current);
+      if (parent === current) {
+        throw new OutputDirectoryError(
+          `Unable to inspect scan output parent directory: ${current}`,
+          { cause: error },
+        );
+      }
+      current = parent;
+    }
+  }
+  while (true) {
+    let metadata: Stats;
+    try {
+      metadata = await lstat(current);
+    } catch (error) {
+      throw new OutputDirectoryError(
+        `Unable to inspect scan output parent directory: ${current}`,
+        { cause: error },
+      );
+    }
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new OutputDirectoryError(
+        `Scan output parent must be a non-symlink directory: ${current}`,
+      );
+    }
+    requireTrustedOutputAncestor(metadata, current, effectiveUid);
+    const parent = dirname(current);
+    if (parent === current) return;
+    current = parent;
+  }
+}
+
+export function requireTrustedOutputAncestor(
+  metadata: Pick<Stats, "mode" | "uid">,
+  path: string,
+  effectiveUid = process.geteuid?.(),
+): void {
+  if (
+    effectiveUid !== undefined &&
+    metadata.uid !== 0 &&
+    metadata.uid !== effectiveUid
+  ) {
+    throw new OutputDirectoryError(
+      `Scan output parent must have a trusted owner: ${path}`,
+    );
+  }
+  if ((metadata.mode & 0o022) === 0) return;
+  if ((metadata.mode & 0o1000) === 0) {
+    throw new OutputDirectoryError(
+      `Scan output parent must not be group- or world-writable without the sticky bit: ${path}`,
     );
   }
 }
