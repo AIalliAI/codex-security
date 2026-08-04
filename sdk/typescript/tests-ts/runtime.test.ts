@@ -238,6 +238,23 @@ describe("plugin runtime preparation", () => {
     ]);
   });
 
+  test("bounds preserved context before starting a headless scan", async () => {
+    const parts = await Promise.all(
+      ["000", "001"].map((part) =>
+        readFile(join(PLUGIN_ROOT, "mcp", `server.mjs.br.part-${part}`)),
+      ),
+    );
+    const runtime = brotliDecompressSync(Buffer.concat(parts)).toString("utf8");
+    const schema =
+      /var startHeadlessStandardScanSchema = \{[\s\S]*?\n\};/u.exec(
+        runtime,
+      )?.[0];
+
+    expect(schema).toContain(
+      "userContext: editableUserContextSchema.max(2400).optional()",
+    );
+  });
+
   test("projects only the unchanged external payload from the source checkout", async () => {
     const root = await temporaryDirectory();
     const workspace = join(root, "workspace");
