@@ -141,7 +141,11 @@ Check or remove the stored sign-in with `npx @openai/codex-security login status
 and `npx @openai/codex-security logout`. Codex Security keeps its sign-in in a
 private, stable Codex home at `$CODEX_SECURITY_STATE_DIR/codex-home`, or at
 `$CODEX_HOME/state/plugins/codex-security/codex-home` when no state directory is
-configured. Login, status, logout, and scans use the same home. Codex manages
+configured. On managed Windows devices, inherited access for `SYSTEM` and local
+`Administrators` is preserved while protecting the home against future changes
+to its parents. Other users and broad groups are rejected, and PowerShell
+Constrained Language Mode is supported. Login,
+status, logout, and scans use the same home. Codex manages
 credentials using its configured file or system-keyring backend and honors
 managed-device policies. An existing file-based Codex sign-in is imported only
 when the dedicated home does not already contain stored credentials. Logging
