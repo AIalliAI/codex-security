@@ -339,77 +339,101 @@ describe("plugin runtime preparation", () => {
     );
   });
 
-  test("uses the same focused Standard handoff in the server and desktop app", async () => {
-    const parts = await Promise.all(
-      ["000", "001"].map((part) =>
-        readFile(join(PLUGIN_ROOT, "mcp", `server.mjs.br.part-${part}`)),
+  test("keeps focused Standard scans on native direct-start tools", async () => {
+    const skill = await readFile(
+      join(PLUGIN_ROOT, "skills", "security-scan", "SKILL.md"),
+      "utf8",
+    );
+    const desktop = await readFile(
+      join(
+        PLUGIN_ROOT,
+        "skills",
+        "security-scan",
+        "references",
+        "desktop-scan.md",
       ),
+      "utf8",
     );
-    const runtime = brotliDecompressSync(Buffer.concat(parts)).toString("utf8");
-    const workspace = brotliDecompressSync(
-      await readFile(join(PLUGIN_ROOT, "mcp", "mcp-app.html.br")),
-    ).toString("utf8");
-    const version = /var version2 = "([^"]+)"/u.exec(runtime)?.[1];
-    expect(version).toBeDefined();
-    expect(workspace).toContain(`\`${version}\``);
 
-    const serverSource =
-      /function buildScanHandoffPrompt\(results, handoffClaimToken\) \{[\s\S]*?\n\}/u.exec(
-        runtime,
-      )?.[0];
-    expect(serverSource).toBeDefined();
-    const marker = workspace.indexOf(
-      "Follow the self-contained security-scan workflow",
-    );
-    expect(marker).toBeGreaterThan(0);
-    const workspaceSource = workspace.slice(
-      workspace.lastIndexOf("function ", marker),
-      workspace.indexOf("function ", marker),
-    );
-    const workspaceName = /^function ([\w$]+)\(/u.exec(workspaceSource)?.[1];
-    const workspacePreflight = /\$\{([\w$]+)\([\w$]+\.mode\)\}/u.exec(
-      workspaceSource,
-    )?.[1];
-    expect(workspaceName).toBeDefined();
-    expect(workspacePreflight).toBeDefined();
-    const preflight = (mode: string) => `validated mode ${mode}`;
-    const serverHandoff = new Function(
-      "scanPreflightInstruction",
-      `${serverSource}\nreturn buildScanHandoffPrompt;`,
-    )(preflight);
-    const workspaceHandoff = new Function(
-      workspacePreflight!,
-      `${workspaceSource}\nreturn ${workspaceName};`,
-    )(preflight);
-    const scan = {
-      scanId: "12345678-1234-4234-8234-123456789abc",
-      scanDir: "/tmp/standard-scan",
-      userContext: "Review authentication boundaries.",
-    };
+    expect(skill).toContain("Immediately launch one baseline subagent");
+    expect(skill).toContain("Launch focused investigator subagents");
+    expect(skill).toContain("record_codex_security_scan_draft");
+    expect(desktop).toContain("start_codex_security_prompt_only_scan");
+    expect(desktop).toContain("record_codex_security_scan_draft");
+    expect(desktop).not.toContain("await_codex_security_scan_start");
+  });
 
-    for (const mode of ["standard", "diff", "deep"]) {
-      const serverPrompt = serverHandoff({ ...scan, mode }, "claim-token");
-      expect(workspaceHandoff({ ...scan, mode }, "claim-token")).toBe(
-        serverPrompt,
+  test("keeps native scan tools without the obsolete setup widget", async () => {
+    const contract = JSON.parse(
+      await readFile(new URL("../plugin-files.json", import.meta.url), "utf8"),
+    ) as { shippedExact: string[] };
+    expect(contract.shippedExact).not.toContain("mcp/mcp-app.html.br");
+    expect(existsSync(join(PLUGIN_ROOT, "mcp", "mcp-app.html.br"))).toBe(false);
+
+    const messages = [
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "codex-security-test", version: "1.0.0" },
+        },
+      },
+      { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+      { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+    ];
+    const server = spawnSync(
+      process.execPath,
+      [join(PLUGIN_ROOT, "mcp", "server.mjs"), "--stdio"],
+      {
+        input: `${messages.map((message) => JSON.stringify(message)).join("\n")}\n`,
+        encoding: "utf8",
+        timeout: 10_000,
+      },
+    );
+    expect(server.status, server.stderr).toBe(0);
+    const responses = server.stdout
+      .trim()
+      .split("\n")
+      .map(
+        (line) =>
+          JSON.parse(line) as {
+            id: number;
+            result: {
+              capabilities?: Record<string, unknown>;
+              tools?: Array<{ name: string }>;
+            };
+          },
       );
-      expect(serverPrompt).toContain(`validated mode ${mode}`);
-      if (mode !== "standard") {
-        expect(serverPrompt).not.toContain("independent baseline audit");
-        continue;
-      }
-      expect(serverPrompt).toContain("independent baseline audit");
-      expect(serverPrompt).toContain("delegate focused investigation packets");
-      expect(serverPrompt).toContain("record_codex_security_scan_draft");
-      expect(serverPrompt).toContain(scan.userContext);
-      for (const obsolete of [
-        "prepare_codex_security_review_items",
-        "record_codex_security_discovery_candidates",
-        "record_codex_security_candidate_validations",
-        "record_codex_security_candidate_attack_paths",
-        "get_codex_security_completed_scan",
-      ]) {
-        expect(serverPrompt).not.toContain(obsolete);
-      }
+    expect(
+      responses.find((response) => response.id === 1)?.result.capabilities,
+    ).not.toHaveProperty("resources");
+    const names = new Set(
+      responses
+        .find((response) => response.id === 2)
+        ?.result.tools?.map((tool) => tool.name),
+    );
+    for (const name of [
+      "open_codex_security_workspace",
+      "start_codex_security_standard_scan",
+      "start_codex_security_prompt_only_scan",
+      "start_codex_security_deep_scan",
+      "record_codex_security_scan_draft",
+      "record_codex_security_candidate_attack_paths",
+      "complete_codex_security_scan",
+    ]) {
+      expect(names.has(name)).toBe(true);
+    }
+    for (const name of [
+      "await_codex_security_scan_start",
+      "get_codex_security_setup_preference",
+      "disable_codex_security_setup_ui",
+      "open_codex_security_triage_results",
+      "set_codex_security_capability_preflight",
+    ]) {
+      expect(names.has(name)).toBe(false);
     }
   });
 
