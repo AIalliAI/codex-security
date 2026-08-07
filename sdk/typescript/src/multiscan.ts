@@ -39,6 +39,7 @@ interface MultiscanTask {
   revision: string;
   mode: ScanMode;
   scope?: string;
+  prompt?: string;
 }
 
 interface MultiscanReceipt extends MultiscanTask {
@@ -57,6 +58,8 @@ export interface MultiscanOptions {
   workers: number;
   mode: ScanMode;
   maxAttempts: number;
+  scanPrompt?: string;
+  postScanPrompt?: string;
   config: CodexSecurityConfig;
   createSecurity(
     config: CodexSecurityConfig,
@@ -111,7 +114,7 @@ async function runCampaign(
   const ledger = join(output, "results.jsonl");
   await ensureOutputDirectory(join(output, "checkouts"));
   await ensureOutputDirectory(join(output, "artifacts"));
-  await ensureManifest(join(output, "manifest.json"), tasks);
+  await ensureManifest(join(output, "manifest.json"), tasks, options);
   const receipts = await readReceipts(ledger);
   const pending: MultiscanTask[] = [];
   let completed = 0;
@@ -184,6 +187,9 @@ async function runCampaign(
               throw new Error("Multiscan scope escapes its repository.");
             }
           }
+          const scanPrompt = [options.scanPrompt?.trim(), task.prompt]
+            .filter(Boolean)
+            .join("\n\n");
           const result = await security.run(checkout, {
             ...(task.scope === undefined ? {} : { target: [task.scope] }),
             ...(options.knowledgeBasePaths?.length
@@ -191,6 +197,10 @@ async function runCampaign(
               : {}),
             mode: task.mode,
             outputDir: scanDir,
+            ...(scanPrompt ? { scanPrompt } : {}),
+            ...(options.postScanPrompt === undefined
+              ? {}
+              : { postScanPrompt: options.postScanPrompt }),
             ...(options.signal === undefined ? {} : { signal: options.signal }),
           });
           cost = result.cost;
@@ -432,8 +442,22 @@ async function recoverLock(
 async function ensureManifest(
   path: string,
   tasks: MultiscanTask[],
+  options: Pick<MultiscanOptions, "scanPrompt" | "postScanPrompt">,
 ): Promise<void> {
-  const expected = `${JSON.stringify({ version: 1, tasks }, null, 2)}\n`;
+  const expected = `${JSON.stringify(
+    {
+      version: 1,
+      tasks,
+      ...(options.scanPrompt === undefined
+        ? {}
+        : { scanPrompt: options.scanPrompt }),
+      ...(options.postScanPrompt === undefined
+        ? {}
+        : { postScanPrompt: options.postScanPrompt }),
+    },
+    null,
+    2,
+  )}\n`;
   try {
     await writeFile(path, expected, { flag: "wx", mode: 0o600 });
   } catch (error) {
@@ -531,6 +555,7 @@ function parseInventory(
       throw new Error("Multiscan mode must be standard or deep.");
     }
     const scope = get("scope");
+    const prompt = get("prompt");
     if (
       scope &&
       (isAbsolute(scope) ||
@@ -546,6 +571,7 @@ function parseInventory(
       revision,
       mode,
       ...(scope ? { scope } : {}),
+      ...(prompt ? { prompt } : {}),
     };
   });
 }
