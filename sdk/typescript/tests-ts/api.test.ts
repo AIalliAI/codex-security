@@ -1940,11 +1940,18 @@ describe("CodexSecurity orchestration", () => {
       "scan_example_001",
     ]);
     expect(commands[2]).toEqual([
+      "set-scan-thread",
+      "--scan-id",
+      "scan_example_001",
+      "--thread-id",
+      "thread-1",
+    ]);
+    expect(commands[3]).toEqual([
       "prepare-scan-completion",
       "--scan-id",
       "scan_example_001",
     ]);
-    expect(commands[3]).toEqual([
+    expect(commands[4]).toEqual([
       "complete-scan",
       "--scan-id",
       "scan_example_001",
@@ -2308,6 +2315,7 @@ describe("CodexSecurity orchestration", () => {
     expect(commands).toEqual([
       "register-cli-scan",
       "get-scan-feedback",
+      "set-scan-thread",
       "prepare-scan-completion",
       "fail-scan",
     ]);
@@ -2820,6 +2828,7 @@ describe("CodexSecurity orchestration", () => {
     expect(commands.map((command) => command[0])).toEqual([
       "register-cli-scan",
       "get-scan-feedback",
+      "set-scan-thread",
       "prepare-scan-completion",
       "complete-scan",
     ]);
@@ -3033,6 +3042,13 @@ describe("CodexSecurity orchestration", () => {
       "scan_example_001",
     ]);
     expect(commands[2]).toEqual([
+      "set-scan-thread",
+      "--scan-id",
+      "scan_example_001",
+      "--thread-id",
+      "scan-thread",
+    ]);
+    expect(commands[3]).toEqual([
       "fail-scan",
       "--scan-id",
       "scan_example_001",
@@ -3108,6 +3124,7 @@ describe("CodexSecurity orchestration", () => {
     expect(commands.map(([command]) => command)).toEqual([
       "register-cli-scan",
       "get-scan-feedback",
+      "set-scan-thread",
       "prepare-scan-completion",
       "complete-scan",
     ]);
@@ -3346,6 +3363,7 @@ describe("CodexSecurity orchestration", () => {
             id: null,
             async runStreamed() {
               async function* failingEvents(): AsyncGenerator<ThreadEvent> {
+                yield { type: "thread.started", thread_id: "failed-thread" };
                 yield {
                   type: "error",
                   message: `${SYNTHETIC_CREDENTIALS} ${quotedCredential}`,
@@ -3373,6 +3391,7 @@ describe("CodexSecurity orchestration", () => {
       ["get-scan", "--scan-id", scanId],
     );
     expect(context["scan"]).toMatchObject({
+      continuationThreadId: "failed-thread",
       progress: { status: "failed" },
       failureMessage: redactedFailure,
     });

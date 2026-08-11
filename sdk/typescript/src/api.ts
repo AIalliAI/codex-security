@@ -996,7 +996,25 @@ export class CodexSecurity {
         authentication,
         workbenchValidated: true,
         model,
-        onThreadStarted: (threadId) => tracker.start(threadId),
+        onThreadStarted: async (threadId) => {
+          tracker.start(threadId);
+          try {
+            await workbench(workbenchOptions, [
+              "set-scan-thread",
+              "--scan-id",
+              scanId,
+              "--thread-id",
+              threadId,
+            ]);
+          } catch (error) {
+            notifyObserver(
+              "onWarning",
+              options.onWarning,
+              options.onObserverError,
+              `Could not save scan session: ${redactedErrorMessage(error)}`,
+            );
+          }
+        },
         onFinalize: async (usage) => {
           const snapshot = await tracker.stop(usage).catch((error: unknown) => {
             if (options.maxCostUsd !== undefined) throw error;
@@ -1727,7 +1745,7 @@ interface ScanEventRunOptions {
   model?: string;
   expectedFilesTotal?: number;
   onFinalize?: (usage: unknown) => Promise<unknown>;
-  onThreadStarted?: (threadId: string) => void;
+  onThreadStarted?: (threadId: string) => Promise<void> | void;
   onScanStarted?: () => void;
   onTrustedAccessStatus?: (status: ScanTrustedAccessStatus) => void;
   onReconnect?: (
@@ -1812,7 +1830,7 @@ export async function runScanEvents(
         const startedThreadId = event["thread_id"];
         if (typeof startedThreadId === "string") {
           threadId = startedThreadId;
-          options.onThreadStarted?.(startedThreadId);
+          await options.onThreadStarted?.(startedThreadId);
         }
         if (!scanStarted) {
           scanStarted = true;

@@ -89,6 +89,7 @@ import {
   matchScanFindings,
   type ScanComparisonInput,
 } from "./scan-comparison.js";
+import { readScanLogs } from "./scan-logs.js";
 import {
   renderScanHistory,
   type HistoryCommand,
@@ -893,6 +894,39 @@ export async function main(
           "show",
           format,
           { showLinkedFindings: options.showLinkedFindings },
+        );
+      },
+    })
+    .command("logs", {
+      description: "Show saved activity for a scan and its workers.",
+      mcp: false,
+      args: z.object({
+        scanId: z
+          .string()
+          .min(1)
+          .describe("Saved scan identifier or unique prefix."),
+      }),
+      output: z.record(z.string(), z.unknown()).optional(),
+      async run({ args }) {
+        return await history(
+          ["get-scan", "--scan-id", args.scanId],
+          async (value) => {
+            const scan = value["scan"] as {
+              scanId: string;
+              continuationThreadId?: string;
+            };
+            const threadId = scan.continuationThreadId;
+            if (!threadId) {
+              throw new CodexSecurityError(
+                `No session is associated with scan ${scan.scanId}.`,
+              );
+            }
+            return (await readScanLogs({
+              scanId: scan.scanId,
+              threadId,
+              codexHome: codexSecurityCredentialHome(dependencies.environment),
+            })) as unknown as JsonObject;
+          },
         );
       },
     })

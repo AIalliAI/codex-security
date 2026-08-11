@@ -84,6 +84,9 @@ npx @openai/codex-security scan . --verbose
 `LOG_LEVEL=debug` is its fallback. JSON results remain on stdout, and
 credentials and provider identifiers remain redacted.
 
+Use `npx @openai/codex-security scans logs SCAN_ID` to inspect saved session
+events from a scan and its workers.
+
 ## TypeScript SDK
 
 ```ts
