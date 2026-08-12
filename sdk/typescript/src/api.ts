@@ -511,20 +511,23 @@ export class CodexSecurity {
         (path) =>
           requireOutputOutsideRepository(protectedRoot, path, "runtime"),
         options.auth,
-        modelProvider,
+        requestedConfig,
       );
       if (
         runtime === previousRuntime &&
         this.#dependencies.prepareRuntime === undefined
       ) {
-        await this.#refreshPersistentRuntime(runtime, scanEnvironment, signal);
+        await this.#refreshPersistentRuntime(
+          runtime,
+          scanEnvironment,
+          signal,
+          requestedConfig,
+        );
       }
       const effectiveConfig = runtime.effectiveConfig ?? requestedConfig;
+      const preflightConfig = scanPreflightCodexConfig(effectiveConfig);
       if (runtime.configPath !== undefined) {
-        await writeCodexConfig(
-          runtime.configPath,
-          scanPreflightCodexConfig(effectiveConfig),
-        );
+        await writeCodexConfig(runtime.configPath, preflightConfig);
       }
       const runtimeHome = await realpath(runtime.codexHome);
       requireOutputOutsideRepository(protectedRoot, runtimeHome, "runtime");
@@ -766,7 +769,7 @@ export class CodexSecurity {
         mode,
         expectation.repositoryRevision,
         runtime.plugin.version,
-        effectiveConfig,
+        preflightConfig,
         options.failureSeverity,
         knowledgeBase?.sources,
         options.maxCostUsd,
@@ -981,7 +984,7 @@ export class CodexSecurity {
         CODEX_HOME: runtime.codexHome,
         ...runtimePaths,
       };
-      const sdkCodexConfig = scanPreflightCodexConfig(effectiveConfig);
+      const sdkCodexConfig = { ...preflightConfig };
       delete sdkCodexConfig["projects"];
       const codex = this.#dependencies.createCodex({
         ...(externalProvider !== null || apiKey === null ? {} : { apiKey }),
@@ -1468,7 +1471,7 @@ export class CodexSecurity {
     temporaryRoot?: string,
     validateLocation?: (path: string) => void,
     auth: ScanAuthMode = "auto",
-    modelProvider?: unknown,
+    requestedConfig?: JsonObject,
   ): Promise<PreparedRuntime> {
     this.#requireOpen();
     if (this.#runtime !== null) return this.#runtime;
@@ -1478,7 +1481,7 @@ export class CodexSecurity {
         temporaryRoot,
         validateLocation,
         auth,
-        modelProvider,
+        requestedConfig,
       );
       this.#runtimePromise = runtimePromise;
       void runtimePromise.catch(() => {
@@ -1513,9 +1516,9 @@ export class CodexSecurity {
     runtime: PreparedRuntime,
     environment: ProcessEnvironment,
     signal: AbortSignal,
+    mergedConfig: JsonObject,
   ): Promise<void> {
     throwIfAborted(signal);
-    const mergedConfig = await mergedCodexConfig(this.config);
     const config = await preserveCodexSecurityPluginRegistration(
       runtime.codexHome,
       scanRuntimeCodexConfig(
@@ -1525,12 +1528,6 @@ export class CodexSecurity {
       ),
     );
     await writeCodexConfig(join(runtime.codexHome, "config.toml"), config);
-    if (runtime.configPath !== undefined) {
-      await writeCodexConfig(
-        runtime.configPath,
-        scanPreflightCodexConfig(mergedConfig),
-      );
-    }
     runtime.plugin = await bootstrapPlugin(
       runtime.codexHome,
       runtime.plugin.pluginRoot,
@@ -1588,11 +1585,15 @@ export class CodexSecurity {
     temporaryRoot?: string,
     validateLocation?: (path: string) => void,
     auth: ScanAuthMode = "auto",
-    modelProvider?: unknown,
+    requestedConfig?: JsonObject,
   ): Promise<PreparedRuntime> {
     if (this.#dependencies.prepareRuntime !== undefined) {
       return await this.#dependencies.prepareRuntime(this.config, signal);
     }
+    const modelProvider =
+      requestedConfig === undefined
+        ? undefined
+        : scanModelProvider(requestedConfig);
     const processEnvironment = selectedScanEnvironment(
       this.#dependencies.environment,
       auth,
@@ -1620,7 +1621,8 @@ export class CodexSecurity {
         "CODEX_HOME",
       );
       const ambientHome = configuredAmbientHome ?? nodeAmbientHome;
-      const mergedConfig = await mergedCodexConfig(this.config);
+      const mergedConfig =
+        requestedConfig ?? (await mergedCodexConfig(this.config));
       const codexConfig = await preserveCodexSecurityPluginRegistration(
         codexHome,
         scanRuntimeCodexConfig(
@@ -1631,10 +1633,6 @@ export class CodexSecurity {
       );
       await writeCodexConfig(join(codexHome, "config.toml"), codexConfig);
       const configPath = join(bootstrapWorkspace, "config-preflight.toml");
-      await writeCodexConfig(
-        configPath,
-        scanPreflightCodexConfig(mergedConfig),
-      );
       throwIfAborted(signal);
       const plugin = await bootstrapPlugin(codexHome, pluginRoot, {
         environment: withoutCodexHome(processEnvironment),
@@ -2220,7 +2218,7 @@ function scanRecipe(
   mode: ScanMode,
   repositoryRevision: string | null,
   pluginVersion: string,
-  effectiveConfig: JsonObject,
+  preflightConfig: JsonObject,
   failOnSeverity?: SeverityLevel,
   knowledgeBasePaths?: string[],
   maxCostUsd?: number,
@@ -2239,7 +2237,7 @@ function scanRecipe(
     mode,
     ...(repositoryRevision === null ? {} : { repositoryRevision }),
     pluginVersion,
-    config: scanPreflightCodexConfig(effectiveConfig),
+    config: preflightConfig,
     ...(failOnSeverity === undefined ? {} : { failOnSeverity }),
     ...(knowledgeBasePaths === undefined ? {} : { knowledgeBasePaths }),
     ...(maxCostUsd === undefined ? {} : { maxCostUsd }),
