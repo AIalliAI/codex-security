@@ -195,6 +195,20 @@ async function temporaryDirectory(): Promise<string> {
   return path;
 }
 
+function nodeCodex(script: string): {
+  command: { command: string };
+  environment: Record<string, string>;
+} {
+  return {
+    command: {
+      command: execFileSync("node", ["-p", "process.execPath"], {
+        encoding: "utf8",
+      }).trim(),
+    },
+    environment: { NODE_OPTIONS: `--import=${pathToFileURL(script).href}` },
+  };
+}
+
 async function copyCompletedScan(root: string): Promise<string> {
   const scanDir = join(root, "scan");
   await cp(EXAMPLE, scanDir, { recursive: true });
@@ -5077,23 +5091,76 @@ describe("CodexSecurity orchestration", () => {
     await client.close();
   });
 
+  test("uses one configured Codex executable for scans and nested workers", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    const scanDir = join(root, "scan");
+    const executable = join(root, "custom codex");
+    await mkdir(repository);
+    await mkdir(codexHome);
+    await mkdir(scanDir, { mode: 0o700 });
+    let codexOptions: CodexOptions | null = null;
+    const client = new TestClient(
+      {},
+      {
+        environment: {
+          OPENAI_API_KEY: "ambient-key",
+          CODEX_CLI_PATH: ` ${executable} `,
+        },
+        prepareRuntime: async () => ({
+          ...preparedRuntime(codexHome),
+          environment: {
+            CODEX_HOME: codexHome,
+            CODEX_CLI_PATH: ` ${executable} `,
+          },
+        }),
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        createCodex: (options: CodexOptions) => {
+          codexOptions = options;
+          return {
+            startThread: () => ({
+              id: null,
+              async runStreamed() {
+                await copyCompletedScan(root);
+                return { events: completedEvents() };
+              },
+            }),
+          };
+        },
+      },
+    );
+
+    await client.run(repository);
+    expect((codexOptions as CodexOptions | null)?.codexPathOverride).toBe(
+      executable,
+    );
+    expect((codexOptions as CodexOptions | null)?.env?.["CODEX_CLI_PATH"]).toBe(
+      executable,
+    );
+    await client.close();
+  });
+
   test("authenticates without initializing the plugin runtime", async () => {
     const root = await temporaryDirectory();
     const stateDirectory = join(root, "state");
     const codexHome = join(stateDirectory, "codex-home");
     const fakeCodex = join(root, "codex.mjs");
     await writeFile(fakeCodex, "process.exitCode = 1;\n");
+    const fakeCommand = nodeCodex(fakeCodex);
     const client = new TestClient(
       { pluginPath: join(root, "missing-plugin") },
       {
-        environment: { CODEX_SECURITY_STATE_DIR: stateDirectory },
+        environment: {
+          CODEX_SECURITY_STATE_DIR: stateDirectory,
+          ...fakeCommand.environment,
+        },
         prepareRuntime: async () => {
           throw new Error("authentication must not initialize the plugin");
         },
-        resolveCodexCommand: () => ({
-          command: process.execPath,
-          prefixArgs: [fakeCodex],
-        }),
+        resolveCodexCommand: () => fakeCommand.command,
       },
     );
 
@@ -5125,9 +5192,10 @@ describe("CodexSecurity orchestration", () => {
       `
 import { writeFileSync } from "node:fs";
 writeFileSync(${JSON.stringify(nativeLoginMarker)}, "native login was invoked");
-process.exitCode = 2;
+process.exit(2);
 `,
     );
+    const fakeCommand = nodeCodex(fakeCodex);
     let codexOptions: CodexOptions | null = null;
     let selectedAuthentication: unknown;
     let pythonEnvironment: Record<string, string | undefined> | undefined;
@@ -5154,13 +5222,11 @@ process.exitCode = 2;
             CODEX_HOME: codexHome,
             OpenAi_Api_Key: "forwarded-openai-key",
             codex_api_key: "forwarded-codex-key",
+            ...fakeCommand.environment,
           },
           credentialsAvailable: false,
         }),
-        resolveCodexCommand: () => ({
-          command: process.execPath,
-          prefixArgs: [fakeCodex],
-        }),
+        resolveCodexCommand: () => fakeCommand.command,
         resolvePluginPython: async (options: {
           environment?: Record<string, string | undefined>;
           protectedRoot?: string;
@@ -5228,15 +5294,19 @@ process.exitCode = 2;
     await writeFile(
       fakeCodex,
       `
-if (process.argv.slice(2).join(" ") !== "login status") {
-  process.exitCode = 2;
+import { basename } from "node:path";
+
+if ([basename(process.argv[1]), ...process.argv.slice(2)].join(" ") !== "login status") {
+  process.exit(2);
 } else if (process.env.CODEX_HOME !== ${JSON.stringify(codexHome)}) {
-  process.exitCode = 3;
+  process.exit(3);
 } else {
   console.log("Logged in using ChatGPT");
+  process.exit(0);
 }
 `,
     );
+    const fakeCommand = nodeCodex(fakeCodex);
 
     const client = new TestClient(
       {},
@@ -5244,13 +5314,10 @@ if (process.argv.slice(2).join(" ") !== "login status") {
         environment: { CODEX_SECURITY_STATE_DIR: join(root, "state") },
         prepareRuntime: async () => ({
           ...preparedRuntime(codexHome),
-          environment: { CODEX_HOME: codexHome },
+          environment: { CODEX_HOME: codexHome, ...fakeCommand.environment },
           credentialsAvailable: false,
         }),
-        resolveCodexCommand: () => ({
-          command: process.execPath,
-          prefixArgs: [fakeCodex],
-        }),
+        resolveCodexCommand: () => fakeCommand.command,
         resolvePluginPython: async () => "/managed/python",
         prepareOutputDir: async () => scanDir,
         repositoryRevision: async () => "deadbeef",
@@ -5961,10 +6028,14 @@ if (process.argv.slice(2).join(" ") !== "login status") {
       fakeCodex,
       'console.error("Open https://auth.example.test/device");\nconsole.error("User code: ABCD-EFGH");\nprocess.on("SIGTERM", () => {});\nsetInterval(() => {}, 1000);\n',
     );
+    const fakeCommand = nodeCodex(fakeCodex);
     const client = new TestClient(
       {},
       {
-        environment: { CODEX_SECURITY_STATE_DIR: root },
+        environment: {
+          CODEX_SECURITY_STATE_DIR: root,
+          ...fakeCommand.environment,
+        },
         prepareRuntime: async () => ({
           codexHome,
           plugin: {
@@ -5975,13 +6046,10 @@ if (process.argv.slice(2).join(" ") !== "login status") {
             name: "codex-security",
             version: "0.1.0",
           },
-          environment: {},
+          environment: fakeCommand.environment,
           credentialsAvailable: false,
         }),
-        resolveCodexCommand: () => ({
-          command: process.execPath,
-          prefixArgs: [fakeCodex],
-        }),
+        resolveCodexCommand: () => fakeCommand.command,
         createCodex: () => {
           throw new Error("not used");
         },
@@ -6090,10 +6158,14 @@ for await (const _chunk of process.stdin) {}
 setInterval(() => {}, 1000);
 `,
     );
+    const fakeCommand = nodeCodex(fakeCodex);
     const client = new TestClient(
       {},
       {
-        environment: { CODEX_SECURITY_STATE_DIR: root },
+        environment: {
+          CODEX_SECURITY_STATE_DIR: root,
+          ...fakeCommand.environment,
+        },
         prepareRuntime: async () => ({
           codexHome,
           plugin: {
@@ -6104,13 +6176,10 @@ setInterval(() => {}, 1000);
             name: "codex-security",
             version: "0.1.0",
           },
-          environment: {},
+          environment: fakeCommand.environment,
           credentialsAvailable: false,
         }),
-        resolveCodexCommand: () => ({
-          command: process.execPath,
-          prefixArgs: [fakeCodex],
-        }),
+        resolveCodexCommand: () => fakeCommand.command,
         createCodex: () => {
           throw new Error("not used");
         },
