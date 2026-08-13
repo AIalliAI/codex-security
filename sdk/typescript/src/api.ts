@@ -67,6 +67,7 @@ import type { SeverityLevel } from "./models.js";
 import { scanActivitiesFromEvent, type ScanActivity } from "./scan-activity.js";
 import {
   matchCompletedScan,
+  matchScanFindingsInternal,
   type matchScanFindings,
 } from "./scan-comparison.js";
 import {
@@ -966,6 +967,7 @@ export class CodexSecurity {
         CODEX_SECURITY_SCAN_DIR: scanDir,
         CODEX_SECURITY_PLUGIN_ROOT: shellPluginRoot,
         CODEX_SECURITY_STATE_DIR: stateDirectory,
+        CODEX_SECURITY_SURFACE: this.#surface,
         CODEX_SECURITY_SCAN_ID: scanId,
         CODEX_SECURITY_TARGET_ID: targetId,
         CODEX_SECURITY_TARGET_DISPLAY_NAME: basename(repo),
@@ -1266,7 +1268,12 @@ export class CodexSecurity {
             falsePositives: falsePositiveExamples as Record<string, unknown>[],
             findings: result.findings.findings,
             workbench: runWorkbench,
-            matchFindings: this.#dependencies.matchFindings,
+            matchFindings:
+              this.#dependencies.matchFindings ??
+              ((input, comparisonOptions) =>
+                matchScanFindingsInternal(input, comparisonOptions, {
+                  surface: this.#surface,
+                })),
             environment,
             model,
             signal,
@@ -2050,7 +2057,7 @@ export async function runScanEvents(
   let lastStreamError: string | null = null;
   let tacStatusReported = false;
   try {
-    for await (const event of options.events) {
+    for await (const event of scanEventsWithOptionalUsage(options.events)) {
       if (!tacStatusReported) {
         const tacStatus = trustedAccessStatusFromEvent(event);
         if (tacStatus !== null) {
@@ -2206,6 +2213,24 @@ export async function runScanEvents(
         options.scanDir,
         { cause: error },
       );
+    }
+    throw error;
+  }
+}
+
+async function* scanEventsWithOptionalUsage(
+  events: AsyncGenerator<ScanEvent>,
+): AsyncGenerator<ScanEvent> {
+  try {
+    yield* events;
+  } catch (error) {
+    if (
+      error instanceof TypeError &&
+      /\b(?:null|undefined)\b/u.test(error.message) &&
+      /\bcache_write_input_tokens\b/u.test(error.message)
+    ) {
+      yield { type: "turn.completed", usage: null };
+      return;
     }
     throw error;
   }

@@ -260,6 +260,7 @@ async function* completedEvents(): AsyncGenerator<ThreadEvent> {
     usage: {
       input_tokens: 10,
       cached_input_tokens: 2,
+      cache_write_input_tokens: 0,
       output_tokens: 3,
       reasoning_output_tokens: 1,
     },
@@ -3022,6 +3023,7 @@ describe("CodexSecurity orchestration", () => {
     const usage = {
       input_tokens: 10,
       cached_input_tokens: 2,
+      cache_write_input_tokens: 0,
       output_tokens: 3,
       reasoning_output_tokens: 1,
     };
@@ -3559,18 +3561,25 @@ describe("CodexSecurity orchestration", () => {
           }
           return {};
         },
-        createCodex: () => ({
-          startThread: () => ({
-            id: null,
-            async runStreamed() {
+        createCodex: (options: CodexOptions) => ({
+          startThread(threadOptions: Parameters<Codex["startThread"]>[0]) {
+            const thread = new Codex({
+              ...options,
+              codexPathOverride: process.execPath,
+            }).startThread(threadOptions);
+            const executable = thread as unknown as {
+              _exec: { run(): AsyncGenerator<string> };
+            };
+            executable._exec.run = async function* () {
               await copyCompletedScan(root);
-              async function* events() {
-                yield { type: "thread.started", thread_id: "scan-thread" };
-                yield { type: "turn.completed", usage: null };
-              }
-              return { events: events() };
-            },
-          }),
+              yield JSON.stringify({
+                type: "thread.started",
+                thread_id: "scan-thread",
+              });
+              yield JSON.stringify({ type: "turn.completed", usage: null });
+            };
+            return thread;
+          },
         }),
       },
     );
@@ -4039,6 +4048,7 @@ describe("CodexSecurity orchestration", () => {
                 join(codexHome!, "config.toml"),
                 "utf8",
               );
+              expect(options.env?.["CODEX_SECURITY_SURFACE"]).toBe("sdk");
               expect(codexConfig).toContain(
                 'model_reasoning_summary = "detailed"',
               );
