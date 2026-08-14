@@ -368,7 +368,7 @@ interface CliDependencies {
   bulkScan?: BulkScanDiscoveryDependencies;
   runWorkbench(args: readonly string[]): Promise<JsonObject>;
   matchFindings: typeof matchScanFindings;
-  checkForUpdate(): Promise<UpdateNotice | undefined>;
+  checkForUpdate(signal: AbortSignal): Promise<UpdateNotice | undefined>;
 }
 
 const DEFAULT_DEPENDENCIES: CliDependencies = {
@@ -376,7 +376,8 @@ const DEFAULT_DEPENDENCIES: CliDependencies = {
     createSecurityInternal(config, { surface: "cli" }),
   environment: process.env,
   prepareAuthenticationHome: prepareCodexSecurityCredentialHome,
-  checkForUpdate: () => checkForUpdate({ environment: process.env }),
+  checkForUpdate: (signal) =>
+    checkForUpdate({ environment: process.env, signal }),
   hasStoredChatGPTSignIn: async () => {
     const environment = Object.fromEntries(
       Object.entries(process.env).filter(
@@ -706,6 +707,7 @@ export async function main(
     errorOutput.write(`codex-security: ${argumentError}\n`);
     return 2;
   }
+  const updateController = new AbortController();
   const pendingUpdate =
     errorOutput.isTTY === true &&
     argv.length > 0 &&
@@ -722,7 +724,9 @@ export async function main(
       ].includes(argument),
     ) &&
     updateNoticeEnabled(dependencies.environment)
-      ? dependencies.checkForUpdate().catch(() => undefined)
+      ? dependencies
+          .checkForUpdate(updateController.signal)
+          .catch(() => undefined)
       : undefined;
   let exitCode = 0;
   let frameworkExit: number | undefined;
@@ -1875,25 +1879,30 @@ export async function main(
       },
     });
 
-  await cli.serve(
-    argv.flatMap((argument) =>
-      argument.startsWith("--format=")
-        ? ["--format", argument.slice("--format=".length)]
-        : [argument],
-    ),
-    {
-      stdout: (value) => {
-        frameworkOutput += value;
+  let notice: UpdateNotice | undefined;
+  try {
+    await cli.serve(
+      argv.flatMap((argument) =>
+        argument.startsWith("--format=")
+          ? ["--format", argument.slice("--format=".length)]
+          : [argument],
+      ),
+      {
+        stdout: (value) => {
+          frameworkOutput += value;
+        },
+        exit: (code) => {
+          frameworkExit = code;
+        },
       },
-      exit: (code) => {
-        frameworkExit = code;
-      },
-    },
-  );
-  if (pendingUpdate !== undefined) {
-    const notice = await pendingUpdate;
-    if (notice !== undefined) errorOutput.write(formatUpdateNotice(notice));
+    );
+    if (pendingUpdate !== undefined) {
+      notice = await Promise.race([pendingUpdate, undefined]);
+    }
+  } finally {
+    updateController.abort();
   }
+  if (notice !== undefined) errorOutput.write(formatUpdateNotice(notice));
   if (frameworkExit !== undefined) {
     if (exitCode !== 0) return exitCode;
     errorOutput.write(
