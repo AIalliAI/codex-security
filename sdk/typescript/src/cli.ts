@@ -128,6 +128,8 @@ const SHOW_CURSOR = "\u001B[?25h";
 const CHILD_TERMINATION_GRACE_MS = 1_000;
 
 type Writable = Pick<NodeJS.WriteStream, "write"> & {
+  on?(event: "error", listener: (error: Error) => void): unknown;
+  off?(event: "error", listener: (error: Error) => void): unknown;
   readonly isTTY?: boolean;
   readonly fd?: number;
   readonly columns?: number;
@@ -2647,6 +2649,39 @@ async function runScan(
   dependencies: CliDependencies,
   interactive = true,
 ): Promise<ScanOutcome> {
+  const observeTerminalErrors =
+    typeof errorOutput.on === "function" &&
+    typeof errorOutput.off === "function";
+  const ignoreTerminalError = (): void => {};
+  if (observeTerminalErrors) {
+    errorOutput.on?.("error", ignoreTerminalError);
+  }
+  try {
+    return await executeScan(
+      arguments_,
+      errorOutput,
+      dependencies,
+      interactive,
+    );
+  } finally {
+    if (observeTerminalErrors) {
+      try {
+        errorOutput.write("", () => {
+          queueMicrotask(() => errorOutput.off?.("error", ignoreTerminalError));
+        });
+      } catch {
+        errorOutput.off?.("error", ignoreTerminalError);
+      }
+    }
+  }
+}
+
+async function executeScan(
+  arguments_: ScanArguments,
+  errorOutput: Writable,
+  dependencies: CliDependencies,
+  interactive = true,
+): Promise<ScanOutcome> {
   let scanDir: string | null = null;
   let requestedSignal: SignalName | null = null;
   let firstSignalAt = 0;
@@ -2691,6 +2726,14 @@ async function runScan(
     });
   };
   const preparationAbortController = new AbortController();
+  const stopPresentation = (): void => {
+    try {
+      dashboard?.stop();
+    } catch {}
+    try {
+      progress?.stopTimer();
+    } catch {}
+  };
   const signalListener = (signal: SignalName) => () => {
     if (requestedSignal !== null) {
       // Launchers and terminals can deliver the same initial signal twice.
@@ -2702,8 +2745,7 @@ async function runScan(
         return;
       }
       requestedSignal = signal;
-      dashboard?.stop();
-      progress?.stopTimer();
+      stopPresentation();
       if (progress?.interactive === true) {
         try {
           dependencies.writeSynchronously(errorOutput, SHOW_CURSOR);
@@ -3150,8 +3192,7 @@ async function runScan(
     failed = true;
     failure = error;
   } finally {
-    dashboard?.stop();
-    progress?.stopTimer();
+    stopPresentation();
     if (security !== null) {
       diagnostic("runtime.cleanup.started");
       await security.close().then(
@@ -3229,6 +3270,7 @@ async function runScan(
           : undefined,
       verified: effectivePreflight.authentication.verified,
     });
+    progress?.stopTimer();
     return { exitCode: 0, data: { dryRun: true, ...effectivePreflight } };
   }
   if (result === null) {
@@ -3277,6 +3319,7 @@ async function runScan(
     errorOutput.write(
       "codex-security: Scan target changed during execution; results do not represent the current checkout.\n",
     );
+    progress?.stopTimer();
     return { exitCode: 2, data: scanData };
   }
   if (incomplete) {
@@ -3285,8 +3328,10 @@ async function runScan(
         ? `codex-security: Scan coverage is ${result.coverage.completeness}; results may be incomplete.\n`
         : `codex-security: Cannot evaluate the failure policy: coverage is ${result.coverage.completeness}.\n`,
     );
+    progress?.stopTimer();
     return { exitCode: 2, data: scanData };
   }
+  progress?.stopTimer();
   return { exitCode: blockingCount > 0 ? 1 : 0, data: scanData };
 }
 
@@ -3713,6 +3758,10 @@ export class Progress {
   #timerMessage: string | null = null;
   #timerLineActive = false;
   #cursorHidden = false;
+  #observingStreamErrors = false;
+  #streamErrorsActive = false;
+  #streamErrorGeneration = 0;
+  readonly #onStreamError = (): void => {};
 
   public constructor(
     stream: Writable = process.stderr,
@@ -3740,10 +3789,12 @@ export class Progress {
   }
 
   public stage(message: string): void {
+    this.#observeStreamErrors();
     this.#stream.write(`${this.#line(message)}\n`);
   }
 
   public startTimer(message: string): void {
+    this.#observeStreamErrors();
     if (!this.interactive) {
       this.stage(message);
       return;
@@ -3751,26 +3802,51 @@ export class Progress {
     this.#stream.write(HIDE_CURSOR);
     this.#cursorHidden = true;
     this.#renderTimer(message);
-    this.#timer = this.#dependencies.setInterval(
-      () => this.#renderTimer(message),
-      PROGRESS_REFRESH_MILLISECONDS,
-    );
+    this.#timer = this.#dependencies.setInterval(() => {
+      try {
+        this.#renderTimer(message);
+      } catch {}
+    }, PROGRESS_REFRESH_MILLISECONDS);
     this.#timerMessage = message;
   }
 
   public stopTimer(): void {
-    if (this.#timer !== null) {
-      this.#dependencies.clearInterval(this.#timer);
-      this.#timer = null;
-    }
-    this.#timerMessage = null;
-    if (this.#timerLineActive) {
-      this.#stream.write("\n");
-      this.#timerLineActive = false;
-    }
-    if (this.#cursorHidden) {
-      this.#stream.write(SHOW_CURSOR);
-      this.#cursorHidden = false;
+    try {
+      if (this.#timer !== null) {
+        this.#dependencies.clearInterval(this.#timer);
+        this.#timer = null;
+      }
+      this.#timerMessage = null;
+      if (this.#timerLineActive) {
+        this.#stream.write("\n");
+        this.#timerLineActive = false;
+      }
+      if (this.#cursorHidden) {
+        this.#stream.write(SHOW_CURSOR);
+        this.#cursorHidden = false;
+      }
+    } finally {
+      if (this.#observingStreamErrors) {
+        this.#streamErrorsActive = false;
+        const generation = this.#streamErrorGeneration;
+        try {
+          this.#stream.write("", () => {
+            queueMicrotask(() => {
+              if (
+                generation === this.#streamErrorGeneration &&
+                !this.#streamErrorsActive &&
+                this.#observingStreamErrors
+              ) {
+                this.#stream.off?.("error", this.#onStreamError);
+                this.#observingStreamErrors = false;
+              }
+            });
+          });
+        } catch {
+          this.#stream.off?.("error", this.#onStreamError);
+          this.#observingStreamErrors = false;
+        }
+      }
     }
   }
 
@@ -3793,6 +3869,15 @@ export class Progress {
     const minutes = Math.floor(elapsedSeconds / 60);
     const seconds = elapsedSeconds % 60;
     return `[${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}] ${message}`;
+  }
+
+  #observeStreamErrors(): void {
+    this.#streamErrorsActive = true;
+    this.#streamErrorGeneration += 1;
+    if (!this.#observingStreamErrors && this.#stream.on !== undefined) {
+      this.#stream.on("error", this.#onStreamError);
+      this.#observingStreamErrors = true;
+    }
   }
 
   #renderTimer(message: string): void {
