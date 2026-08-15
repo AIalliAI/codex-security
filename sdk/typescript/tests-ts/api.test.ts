@@ -1908,6 +1908,9 @@ describe("CodexSecurity orchestration", () => {
       default_permissions: "codex_security_scan",
       allow_login_shell: false,
     });
+    expect((codexOptions as CodexOptions | null)?.config).not.toHaveProperty(
+      "approvals_reviewer",
+    );
     expect(threadOptions as Record<string, unknown> | null).toEqual({
       workingDirectory: scanDir,
       skipGitRepoCheck: true,

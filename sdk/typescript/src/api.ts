@@ -2787,11 +2787,24 @@ export function scanRuntimeCodexConfig(
 ): JsonObject {
   const hardened = structuredClone(config);
   delete hardened["sandbox_mode"];
+  delete hardened["approvals_reviewer"];
+  const profiles = hardened["profiles"];
+  if (isRecord(profiles)) {
+    for (const profile of Object.values(profiles)) {
+      if (!isRecord(profile)) continue;
+      delete profile["approval_policy"];
+      delete profile["approvals_reviewer"];
+      delete profile["default_permissions"];
+      delete profile["permissions"];
+      delete profile["sandbox_mode"];
+    }
+  }
   const configuredPermissions = isRecord(hardened["permissions"])
     ? hardened["permissions"]
     : {};
   return {
     ...hardened,
+    approval_policy: "never",
     allow_login_shell: false,
     default_permissions: SCAN_PERMISSION_PROFILE,
     permissions: {
