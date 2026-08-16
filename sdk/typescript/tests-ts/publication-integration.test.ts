@@ -24,6 +24,7 @@ import type {
 } from "../src/models.js";
 import {
   publishScanInternal,
+  type PublishScanDependencies,
   type PublishScanProgress,
   type PublishScanResult,
 } from "../src/publish.js";
@@ -279,6 +280,105 @@ function receiptPath(fixture: PublicationFixture): string {
 }
 
 describe("database-backed Linear publication integration", () => {
+  test("persists unassigned direct team-only publication", async () => {
+    const completed = await fixture(23);
+    const sealed = await artifactDigests(completed.scanDirectory);
+    const key = "lin_api_SYNTHETIC_INTEGRATION_KEY";
+    const environment = {
+      ...completed.environment,
+      CODEX_SECURITY_LINEAR_API_KEY: key,
+    };
+    const stdout = capture();
+    const stderr = capture();
+    const created: string[] = [];
+    const cli = dependencies({ environment });
+    type LinearClient = ReturnType<
+      NonNullable<PublishScanDependencies["linearClient"]>
+    >;
+    type IssueInput = Parameters<LinearClient["createIssue"]>[0];
+
+    cli.publishScan = async (directory, options) =>
+      publishScanInternal(directory, options, {
+        environment,
+        resolveCodex: () => {
+          throw new Error("Direct publication must not start Codex.");
+        },
+        linearClient: ({ apiKey }) => {
+          expect(apiKey).toBe(key);
+          return {
+            users: async () => {
+              throw new Error("Unassigned publication must not look up users.");
+            },
+            createIssue: async (input: IssueInput) => {
+              const index = completed.findings.findIndex(({ findingId }) =>
+                input.description?.includes(findingId),
+              );
+              expect(index).toBeGreaterThanOrEqual(0);
+              expect(input).toMatchObject({
+                teamId: OPTIONS.teamId,
+                priority: 2,
+              });
+              expect(input).not.toHaveProperty("assigneeId");
+              expect(input).not.toHaveProperty("projectId");
+              if (index >= 20)
+                expect(created.length).toBeGreaterThanOrEqual(20);
+              const identifier = `SEC-${index + 1}`;
+              created.push(identifier);
+              return {
+                success: true,
+                issue: Promise.resolve({
+                  identifier,
+                  url: `https://linear.app/example/issue/${identifier}`,
+                }),
+              };
+            },
+          } as unknown as LinearClient;
+        },
+      });
+
+    expect(
+      await main(
+        [
+          "publish",
+          "scan",
+          completed.scanDirectory,
+          "--to",
+          "linear",
+          "--linear-team",
+          OPTIONS.teamId,
+          "--json",
+        ],
+        stdout.stream,
+        stderr.stream,
+        cli,
+      ),
+    ).toBe(0);
+
+    const result = JSON.parse(stdout.text()) as PublishScanResult;
+    expect(result.destination).toEqual({
+      type: "linear",
+      teamId: OPTIONS.teamId,
+    });
+    expect(result.counts).toEqual({ findings: 23, created: 23, failed: 0 });
+    expect(storedPublications(completed)).toEqual(
+      completed.findings.map((finding, index) => ({
+        scan_id: SCAN_ID,
+        finding_id: finding.findingId,
+        occurrence_id: finding.occurrenceId,
+        destination_type: "linear",
+        team_id: OPTIONS.teamId,
+        project_id: null,
+        external_id: `SEC-${index + 1}`,
+        external_url: `https://linear.app/example/issue/SEC-${index + 1}`,
+      })),
+    );
+    expect(JSON.parse(await readFile(receiptPath(completed), "utf8"))).toEqual(
+      result,
+    );
+    expect(await artifactDigests(completed.scanDirectory)).toEqual(sealed);
+    expect(stdout.text()).not.toContain(key);
+  });
+
   test("publishes 23 sealed findings through a durable handoff without Codex JSON", async () => {
     const completed = await fixture(23);
     const sealed = await artifactDigests(completed.scanDirectory);

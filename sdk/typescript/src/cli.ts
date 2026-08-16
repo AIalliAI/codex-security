@@ -223,7 +223,9 @@ const VALUE_OPTIONS = new Set([
   "--reason",
   "--to",
   "--linear-team",
+  "--linear-api-key",
   "--project",
+  "--linear-assignee",
 ]);
 const PROVIDER_OPTION = z
   .enum(["openai", "openrouter", "fireworks", "amazon-bedrock"])
@@ -1538,10 +1540,20 @@ export async function main(
       linearTeam: optionValue("--linear-team")
         .optional()
         .describe("Linear team ID; defaults to CODEX_SECURITY_LINEAR_TEAM."),
+      linearApiKey: optionValue("--linear-api-key")
+        .optional()
+        .describe(
+          "Linear personal API key; defaults to CODEX_SECURITY_LINEAR_API_KEY.",
+        ),
       project: optionValue("--project")
         .optional()
         .describe(
           "Optional Linear project ID; defaults to CODEX_SECURITY_LINEAR_PROJECT.",
+        ),
+      linearAssignee: optionValue("--linear-assignee")
+        .optional()
+        .describe(
+          "Linear assignee email or user ID; omit to leave issues unassigned.",
         ),
       dryRun: z
         .boolean()
@@ -1560,6 +1572,22 @@ export async function main(
       const onTerminate = (): void => cancel("SIGTERM");
       let observingSignals = false;
       try {
+        const selectedApiKey =
+          options.linearApiKey ??
+          dependencies.environment["CODEX_SECURITY_LINEAR_API_KEY"];
+        const linearApiKey = selectedApiKey?.trim() || undefined;
+        if (options.linearApiKey !== undefined && linearApiKey === undefined) {
+          throw new CodexSecurityError("--linear-api-key must not be empty.");
+        }
+        const assigneeId = options.linearAssignee?.trim();
+        if (options.linearAssignee !== undefined && !assigneeId) {
+          throw new CodexSecurityError("--linear-assignee must not be empty.");
+        }
+        if (assigneeId !== undefined && linearApiKey === undefined) {
+          throw new CodexSecurityError(
+            "--linear-assignee requires --linear-api-key or CODEX_SECURITY_LINEAR_API_KEY.",
+          );
+        }
         const teamId =
           options.linearTeam?.trim() ||
           dependencies.environment["CODEX_SECURITY_LINEAR_TEAM"]?.trim();
@@ -1758,6 +1786,8 @@ export async function main(
               teamId,
               ...(projectId === undefined ? {} : { projectId }),
               dryRun: options.dryRun,
+              ...(linearApiKey === undefined ? {} : { linearApiKey }),
+              ...(assigneeId === undefined ? {} : { assigneeId }),
               ...(options.dryRun
                 ? {}
                 : {

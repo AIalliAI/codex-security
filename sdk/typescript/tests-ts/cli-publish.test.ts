@@ -118,6 +118,109 @@ describe("publish scan", () => {
     expect(stderr.text()).toBe("");
   });
 
+  test("selects direct Linear publication and forwards the requested assignee", async () => {
+    for (const scenario of [
+      { flags: [], key: "environment-key", assignee: undefined },
+      {
+        flags: [
+          "--linear-api-key",
+          "explicit-key",
+          "--linear-assignee",
+          "teammate@example.test",
+        ],
+        key: "explicit-key",
+        assignee: "teammate@example.test",
+      },
+      {
+        flags: ["--linear-assignee", "user-123"],
+        key: "environment-key",
+        assignee: "user-123",
+      },
+    ]) {
+      const stdout = capture();
+      const stderr = capture();
+      const deps = dependencies({
+        environment: { CODEX_SECURITY_LINEAR_API_KEY: "environment-key" },
+      });
+      let options: Record<string, unknown> | undefined;
+      deps.publishScan = async (_directory, selected) => {
+        options = { ...selected };
+        return publicationResult();
+      };
+
+      expect(
+        await main(
+          [
+            "publish",
+            "scan",
+            "completed-scan",
+            ...DESTINATION_OPTIONS,
+            ...scenario.flags,
+            "--json",
+          ],
+          stdout.stream,
+          stderr.stream,
+          deps,
+        ),
+      ).toBe(0);
+      expect(options).toMatchObject({
+        linearApiKey: scenario.key,
+        ...(scenario.assignee === undefined
+          ? {}
+          : { assigneeId: scenario.assignee }),
+      });
+      if (scenario.assignee === undefined) {
+        expect(options).not.toHaveProperty("assigneeId");
+      }
+      expect(stdout.text()).not.toContain(scenario.key);
+    }
+  });
+
+  test("rejects a Linear assignee without direct API authentication", async () => {
+    const stdout = capture();
+    const stderr = capture();
+    expect(
+      await main(
+        [
+          "publish",
+          "scan",
+          "completed-scan",
+          ...DESTINATION_OPTIONS,
+          "--linear-assignee",
+          "teammate@example.test",
+        ],
+        stdout.stream,
+        stderr.stream,
+        dependencies(),
+      ),
+    ).toBe(2);
+    expect(stderr.text()).toContain(
+      "--linear-assignee requires --linear-api-key or CODEX_SECURITY_LINEAR_API_KEY.",
+    );
+  });
+
+  test("preserves Linear API error details", async () => {
+    const key = "lin_api_SYNTHETIC_ERROR_DETAILS";
+    const stdout = capture();
+    const stderr = capture();
+    const deps = dependencies({
+      environment: { CODEX_SECURITY_LINEAR_API_KEY: key },
+    });
+    deps.publishScan = async () => {
+      throw new Error(`Linear rejected ${key}.`);
+    };
+
+    expect(
+      await main(
+        ["publish", "scan", "completed-scan", ...DESTINATION_OPTIONS],
+        stdout.stream,
+        stderr.stream,
+        deps,
+      ),
+    ).toBe(2);
+    expect(stderr.text()).toContain(key);
+  });
+
   test("publishes directly to a Linear team when no project is selected", async () => {
     const stdout = capture();
     const stderr = capture();

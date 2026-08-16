@@ -142,6 +142,43 @@ function dependencies(
   };
 }
 
+type LinearClient = ReturnType<
+  NonNullable<PublishScanDependencies["linearClient"]>
+>;
+type LinearIssueInput = Parameters<LinearClient["createIssue"]>[0];
+
+function linearApiClient(
+  publication: PreparedScanPublication,
+  options: {
+    configured?: (apiKey: string) => void;
+    create?: (
+      input: LinearIssueInput,
+      signal: AbortSignal | null | undefined,
+    ) => Promise<void> | void;
+  } = {},
+): NonNullable<PublishScanDependencies["linearClient"]> {
+  return ({ apiKey, signal }) => {
+    options.configured?.(apiKey ?? "");
+    return {
+      users: async () => ({ nodes: [{ id: "assignee-from-email" }] }),
+      createIssue: async (input: LinearIssueInput) => {
+        await options.create?.(input, signal);
+        const index = publication.issues.findIndex(
+          ({ title }) => title === input.title,
+        );
+        const identifier = `SEC-${index + 1}`;
+        return {
+          success: true,
+          issue: Promise.resolve({
+            identifier,
+            url: `https://linear.app/example/issue/${identifier}`,
+          }),
+        };
+      },
+    } as unknown as LinearClient;
+  };
+}
+
 interface PublicationPromptData {
   scanId: string;
   handoffFile: string;
@@ -229,6 +266,178 @@ async function processHasExited(pid: number): Promise<boolean> {
   }
   return false;
 }
+
+describe("direct Linear API publication", () => {
+  test("leaves issues unassigned unless an email or user ID is selected", async () => {
+    for (const scenario of [
+      { requested: undefined, assigned: undefined, teamOnly: false },
+      {
+        requested: "teammate@example.test",
+        assigned: "assignee-from-email",
+        teamOnly: true,
+      },
+      { requested: "user-123", assigned: "user-123", teamOnly: false },
+    ]) {
+      const publication = preparedPublication();
+      if (scenario.teamOnly) delete publication.destination.projectId;
+      const inputs: LinearIssueInput[] = [];
+      let configuredKey = "";
+      const injected = dependencies(
+        publication,
+        {},
+        {
+          linearClient: linearApiClient(publication, {
+            configured: (key) => {
+              configuredKey = key;
+            },
+            create: (input) => {
+              inputs.push(input);
+            },
+          }),
+          resolveCodex: () => {
+            throw new Error("Direct publication must not start Codex.");
+          },
+        },
+      );
+      injected.environment!["CODEX_SECURITY_LINEAR_API_KEY"] =
+        "environment-key";
+      const result = await publishScanInternal(
+        publication.scanDirectory,
+        {
+          destination: "linear",
+          teamId: OPTIONS.teamId,
+          ...(scenario.teamOnly ? {} : { projectId: OPTIONS.projectId }),
+          ...(scenario.requested === undefined
+            ? {}
+            : { linearApiKey: "explicit-key", assigneeId: scenario.requested }),
+        },
+        injected,
+      );
+
+      expect(configuredKey).toBe(
+        scenario.requested === undefined ? "environment-key" : "explicit-key",
+      );
+      expect(inputs).toEqual([
+        {
+          teamId: OPTIONS.teamId,
+          ...(scenario.teamOnly ? {} : { projectId: OPTIONS.projectId }),
+          title: publication.issues[0]!.title,
+          description: publication.issues[0]!.description,
+          priority: 2,
+          ...(scenario.assigned === undefined
+            ? {}
+            : { assigneeId: scenario.assigned }),
+        },
+      ]);
+      if (scenario.assigned === undefined) {
+        expect(inputs[0]).not.toHaveProperty("assigneeId");
+      }
+      expect(result.counts).toEqual({ findings: 1, created: 1, failed: 0 });
+    }
+  });
+
+  test("completes direct batches before continuing and preserves individual failures", async () => {
+    const publication = preparedPublication(23);
+    let started = 0;
+    let completed = 0;
+    let releaseFirstBatch: (() => void) | undefined;
+    const firstBatchStarted = new Promise<void>((resolve) => {
+      releaseFirstBatch = resolve;
+    });
+    const result = await publishScanInternal(
+      publication.scanDirectory,
+      { ...OPTIONS, linearApiKey: "synthetic-key" },
+      dependencies(
+        publication,
+        {},
+        {
+          linearClient: linearApiClient(publication, {
+            create: async (input) => {
+              const index = publication.issues.findIndex(
+                ({ title }) => title === input.title,
+              );
+              started += 1;
+              if (started === 20) releaseFirstBatch?.();
+              if (index < 20) await firstBatchStarted;
+              else expect(completed).toBeGreaterThanOrEqual(20);
+              completed += 1;
+              if (index === 21)
+                throw new Error("Linear rejected this finding.");
+            },
+          }),
+        },
+      ),
+    );
+
+    expect(started).toBe(23);
+    expect(result.counts).toEqual({ findings: 23, created: 22, failed: 1 });
+    expect(result.failed).toEqual([
+      { findingId: "finding-22", error: "Linear rejected this finding." },
+    ]);
+  });
+
+  test("recovers completed direct issues before honoring cancellation", async () => {
+    const publication = preparedPublication(23);
+    const controller = new AbortController();
+    let started = 0;
+    let stopped = 0;
+    let persisted: string[] = [];
+    let receipt: unknown;
+    const injected = dependencies(
+      publication,
+      {},
+      {
+        linearClient: linearApiClient(publication, {
+          create: async (input, signal) => {
+            started += 1;
+            if (input.title === publication.issues[0]!.title) return;
+            await new Promise<void>((_resolve, reject) => {
+              signal?.addEventListener(
+                "abort",
+                () => {
+                  stopped += 1;
+                  reject(new Error("Publication canceled."));
+                },
+                { once: true },
+              );
+            });
+          },
+        }),
+        recordPublishedIssues: async (_prepared, issues) => {
+          persisted = issues.map(({ issueIdentifier }) => issueIdentifier);
+          return [...issues];
+        },
+        writeReceipt: async (result) => {
+          receipt = result;
+        },
+      },
+    );
+
+    await expect(
+      publishScanInternal(
+        publication.scanDirectory,
+        {
+          ...OPTIONS,
+          linearApiKey: "synthetic-key",
+          signal: controller.signal,
+          onProgress: ({ type }) => {
+            if (type === "issue_completed") controller.abort("SIGINT");
+          },
+        },
+        injected,
+      ),
+    ).rejects.toThrow(/publication handoff remains at/u);
+
+    expect({ started, stopped, persisted }).toEqual({
+      started: 20,
+      stopped: 19,
+      persisted: ["SEC-1"],
+    });
+    expect(receipt).toMatchObject({
+      counts: { findings: 23, created: 1, failed: 22 },
+    });
+  });
+});
 
 describe("connected Linear publication", () => {
   test("rejects pre-aborted publication before preparing scans or touching local state", async () => {
