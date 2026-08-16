@@ -82,6 +82,7 @@ import {
 } from "./errors.js";
 import type { SeverityLevel } from "./models.js";
 import { runMultiscan } from "./multiscan.js";
+import { publishScan } from "./publish.js";
 import type { ScanResult } from "./result.js";
 import {
   bundledPluginRoot,
@@ -211,6 +212,9 @@ const VALUE_OPTIONS = new Set([
   "--token-offset",
   "--scan-root",
   "--reason",
+  "--to",
+  "--linear-team",
+  "--project",
 ]);
 const PROVIDER_OPTION = z
   .enum(["openai", "openrouter", "fireworks", "amazon-bedrock"])
@@ -408,6 +412,8 @@ interface CliDependencies {
   ) => Promise<string>;
   hasStoredChatGPTSignIn?: () => Promise<boolean>;
   scanAuthenticationPrompt?: Pick<BulkScanPrompt, "isInteractive" | "select">;
+  publishPrompt?: Pick<BulkScanPrompt, "isInteractive" | "select">;
+  publishScan?: typeof publishScan;
   currentDirectory(): string;
   now(): number;
   setInterval(callback: () => void, milliseconds: number): NodeJS.Timeout;
@@ -1233,8 +1239,213 @@ export async function main(
         );
       },
     });
+  const publication = Cli.create("publish", {
+    description: "Publish completed Codex Security scan findings.",
+  }).command("scan", {
+    description: "Publish every finding from a completed scan to Linear.",
+    destructive: true,
+    mcp: false,
+    args: z.object({
+      scanDir: z
+        .string()
+        .optional()
+        .describe("Completed scan directory; omit to select a saved scan."),
+    }),
+    options: z.object({
+      to: z.literal("linear").describe("Publication destination."),
+      linearTeam: optionValue("--linear-team")
+        .optional()
+        .describe("Linear team ID; defaults to CODEX_SECURITY_LINEAR_TEAM."),
+      project: optionValue("--project")
+        .optional()
+        .describe(
+          "Optional Linear project ID; defaults to CODEX_SECURITY_LINEAR_PROJECT.",
+        ),
+      dryRun: z
+        .boolean()
+        .default(false)
+        .describe("Preview the findings without creating Linear issues."),
+    }),
+    output: z.record(z.string(), z.unknown()).optional(),
+    async run({ args, options }) {
+      const controller = new AbortController();
+      const onInterrupt = (): void => controller.abort("SIGINT");
+      const onTerminate = (): void => controller.abort("SIGTERM");
+      let observingSignals = false;
+      try {
+        const teamId =
+          options.linearTeam?.trim() ||
+          dependencies.environment["CODEX_SECURITY_LINEAR_TEAM"]?.trim();
+        if (!teamId) {
+          throw new CodexSecurityError(
+            "--linear-team or CODEX_SECURITY_LINEAR_TEAM is required.",
+          );
+        }
+        const selectedProject = options.project?.trim();
+        if (options.project !== undefined && !selectedProject) {
+          throw new CodexSecurityError("--project must not be empty.");
+        }
+        const projectId =
+          selectedProject ||
+          dependencies.environment["CODEX_SECURITY_LINEAR_PROJECT"]?.trim() ||
+          undefined;
+
+        let scanDir = args.scanDir;
+        if (scanDir === undefined) {
+          const prompt =
+            dependencies.publishPrompt ??
+            createBulkScanDiscoveryDependencies({
+              output: errorOutput,
+              now: dependencies.now,
+              currentDirectory: dependencies.currentDirectory,
+            }).prompt;
+          if (!prompt.isInteractive()) {
+            throw new CodexSecurityError(
+              "Interactive scan selection requires a terminal. Provide a completed scan directory: codex-security publish scan /path/to/sealed-scan --to linear --linear-team TEAM_ID.",
+            );
+          }
+          const saved = await dependencies.runWorkbench([
+            "list-scans",
+            "--status",
+            "complete",
+          ]);
+          const listedScans = saved["scans"];
+          if (!Array.isArray(listedScans)) {
+            throw new CodexSecurityError(
+              "Could not read completed Codex Security scans.",
+            );
+          }
+          const scans = (
+            await Promise.all(
+              listedScans.map(async (scan) => {
+                if (!isJsonObject(scan)) return undefined;
+                const directory = scan["scanDir"];
+                if (typeof directory !== "string" || directory.length === 0) {
+                  return undefined;
+                }
+                const metadata = await lstat(
+                  resolve(dependencies.currentDirectory(), directory),
+                ).catch(() => undefined);
+                return metadata?.isDirectory() === true &&
+                  !metadata.isSymbolicLink()
+                  ? scan
+                  : undefined;
+              }),
+            )
+          ).filter((scan): scan is JsonObject => scan !== undefined);
+          const choices = scans.flatMap((scan) => {
+            if (!isJsonObject(scan)) return [];
+            const progress = scan["progress"];
+            const scanId = scan["scanId"];
+            const directory = scan["scanDir"];
+            if (
+              typeof scanId !== "string" ||
+              scanId.length === 0 ||
+              typeof directory !== "string" ||
+              directory.length === 0 ||
+              progress === undefined ||
+              !isJsonObject(progress) ||
+              progress["status"] !== "complete"
+            ) {
+              return [];
+            }
+            const targetSummary = scan["targetSummary"];
+            const targetPath = scan["targetPath"];
+            const repository =
+              typeof targetSummary === "string" && targetSummary.trim()
+                ? targetSummary.trim()
+                : typeof targetPath === "string" && targetPath.trim()
+                  ? basename(targetPath)
+                  : "unknown repository";
+            const completedAt = scan["completedAt"];
+            const startedAt = scan["startedAt"];
+            const updatedAt = scan["updatedAt"];
+            const timestamp =
+              typeof completedAt === "string" && completedAt
+                ? completedAt
+                : typeof startedAt === "string" && startedAt
+                  ? startedAt
+                  : typeof updatedAt === "string" && updatedAt
+                    ? updatedAt
+                    : "unknown date";
+            const findingCount = scan["findingCount"];
+            const findings =
+              typeof findingCount === "number"
+                ? `${findingCount} finding${findingCount === 1 ? "" : "s"}`
+                : "unknown findings";
+            return [
+              {
+                label: `${repository} · ${scanId} · ${timestamp} · ${findings} · COMPLETE`,
+                value: directory,
+              },
+            ];
+          });
+          if (choices.length === 0) {
+            throw new CodexSecurityError(
+              "No completed Codex Security scans are available to publish.",
+            );
+          }
+          scanDir = await prompt.select(
+            "Which completed scan would you like to publish?",
+            choices,
+          );
+        }
+
+        if (!options.dryRun) {
+          dependencies.addSignalListener("SIGINT", onInterrupt);
+          dependencies.addSignalListener("SIGTERM", onTerminate);
+          observingSignals = true;
+        }
+        const result = await (dependencies.publishScan ?? publishScan)(
+          resolve(dependencies.currentDirectory(), scanDir),
+          {
+            destination: options.to,
+            teamId,
+            ...(projectId === undefined ? {} : { projectId }),
+            dryRun: options.dryRun,
+            ...(options.dryRun ? {} : { signal: controller.signal }),
+          },
+        );
+        controller.signal.throwIfAborted();
+        if (result.failed.length > 0) exitCode = 2;
+        if ("warnings" in result && Array.isArray(result.warnings)) {
+          for (const warning of result.warnings) {
+            if (typeof warning !== "string") continue;
+            errorOutput.write(
+              `codex-security: ${diagnosticValue(safeErrorMessage(warning))}\n`,
+            );
+          }
+        }
+        return { ...result };
+      } catch (error) {
+        const signal = controller.signal.reason;
+        if (signal === "SIGINT" || signal === "SIGTERM") {
+          const reason =
+            signal === "SIGINT"
+              ? "Publication canceled by Ctrl-C."
+              : "Publication terminated by SIGTERM.";
+          const recovery =
+            error === signal
+              ? ""
+              : ` ${diagnosticValue(safeErrorMessage(error))}`;
+          errorOutput.write(`codex-security: ${reason}${recovery}\n`);
+          exitCode = signal === "SIGINT" ? 130 : 143;
+        } else {
+          errorOutput.write(`codex-security: ${errorMessage(error)}\n`);
+          exitCode = 2;
+        }
+        return undefined;
+      } finally {
+        if (observingSignals) {
+          dependencies.removeSignalListener("SIGINT", onInterrupt);
+          dependencies.removeSignalListener("SIGTERM", onTerminate);
+        }
+      }
+    },
+  });
   const cli = Cli.create("codex-security", {
-    description: "Run, validate, patch, and export Codex Security findings.",
+    description:
+      "Run, validate, patch, export, and publish Codex Security findings.",
     version: VERSION,
     mcp: {
       command: "npx --yes @openai/codex-security --mcp",
@@ -1534,6 +1745,7 @@ export async function main(
     })
     .command(scanHistory)
     .command(findingFeedback)
+    .command(publication)
     .command("bulk-scan", {
       description:
         "Discover repositories and run resumable bulk security scans.",
@@ -2240,6 +2452,7 @@ function validateCliArguments(
       "scans",
       "findings",
       "export",
+      "publish",
       "validate",
       "patch",
       "login",
@@ -2302,7 +2515,8 @@ function validateCliArguments(
       return "Markdown output is not supported for scan results.";
     }
   }
-  const nestedCommand = command === "scans" || command === "findings";
+  const nestedCommand =
+    command === "scans" || command === "findings" || command === "publish";
   const subcommand = nestedCommand ? argv[commandIndex + 1] : undefined;
   if (command === "info") {
     const metadataFields = new Set([

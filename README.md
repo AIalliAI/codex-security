@@ -79,6 +79,29 @@ root cause, reuses saved matches, and identifies new, persisting, reopened,
 resolved, or unknown findings. Missing findings remain unknown when coverage is
 incomplete or their original location was not reviewed.
 
+## Publish scan findings
+
+Publish every finding from a completed scan to a Linear team:
+
+```bash
+npx @openai/codex-security publish scan /path/to/scan \
+  --to linear \
+  --linear-team TEAM_ID
+```
+
+Add `--project PROJECT_ID` to place the issues in a Linear project, or omit it
+to create issues directly in the team. Omit the scan directory to select a
+completed scan interactively. You can also set `CODEX_SECURITY_LINEAR_TEAM` and
+the optional `CODEX_SECURITY_LINEAR_PROJECT` instead of passing the destination
+flags. Add `--dry-run` to preview the issues or `--json` to return
+machine-readable results.
+
+Publishing uses your existing Codex sign-in and connected Linear app; no
+separate Linear token is required. Every finding creates a new issue containing
+the scan ID, affected code locations, source snippets, and remediation guidance.
+Choose a destination authorized to receive the repository's source code and
+vulnerability details.
+
 ## Verbose diagnostics
 
 Add `--verbose` to print scan diagnostics to stderr:
