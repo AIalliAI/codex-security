@@ -33,6 +33,7 @@ import { cwd } from "node:process";
 import { createInterface } from "node:readline";
 import { Readable, Writable as NodeWritable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { stripVTControlCharacters } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Cli, z } from "incur";
 import { parse as parseToml } from "smol-toml";
@@ -82,7 +83,11 @@ import {
 } from "./errors.js";
 import type { SeverityLevel } from "./models.js";
 import { runMultiscan } from "./multiscan.js";
-import { publishScan } from "./publish.js";
+import {
+  publishScan,
+  type PublishScanProgress,
+  type PublishScanResult,
+} from "./publish.js";
 import type { ScanResult } from "./result.js";
 import {
   bundledPluginRoot,
@@ -101,6 +106,7 @@ import {
   type matchScanFindings,
   type ScanComparisonInput,
 } from "./scan-comparison.js";
+import { scanActivitiesFromEvent } from "./scan-activity.js";
 import { readScanLogs } from "./scan-logs.js";
 import {
   renderScanHistory,
@@ -134,6 +140,9 @@ const SCAN_HISTORY_OUTPUT_OPTION =
 const HIDE_CURSOR = "\u001B[?25l";
 const SHOW_CURSOR = "\u001B[?25h";
 const CHILD_TERMINATION_GRACE_MS = 1_000;
+const PUBLICATION_GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
+  granularity: "grapheme",
+});
 
 type Writable = Pick<NodeJS.WriteStream, "write"> & {
   on?(event: "error", listener: (error: Error) => void): unknown;
@@ -223,6 +232,278 @@ const PROVIDER_OPTION = z
 
 function optionValue(flag: string) {
   return z.string().min(1, `${flag} must not be empty.`);
+}
+
+function publicationScanAge(timestamp: string, now: number): string {
+  const completedAt = Date.parse(timestamp);
+  if (!Number.isFinite(completedAt)) return "unknown";
+
+  const elapsed = Math.max(0, now - completedAt);
+  const units = [
+    ["year", 365 * 24 * 60 * 60 * 1_000],
+    ["month", 30 * 24 * 60 * 60 * 1_000],
+    ["week", 7 * 24 * 60 * 60 * 1_000],
+    ["day", 24 * 60 * 60 * 1_000],
+    ["hour", 60 * 60 * 1_000],
+    ["minute", 60 * 1_000],
+    ["second", 1_000],
+  ] as const;
+
+  for (const [unit, duration] of units) {
+    const count = Math.floor(elapsed / duration);
+    if (count > 0) {
+      return `${count} ${unit}${count === 1 ? "" : "s"} ago`;
+    }
+  }
+  return "just now";
+}
+
+function publicationDisplayWidth(value: string): number {
+  const segments = PUBLICATION_GRAPHEME_SEGMENTER.segment(
+    stripVTControlCharacters(value),
+  );
+  let width = 0;
+
+  for (const { segment } of segments) {
+    if (/^[\p{Mark}\p{Cf}]+$/u.test(segment)) continue;
+    width +=
+      /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Emoji_Presentation}\p{Regional_Indicator}\u3000-\u303F\uFF01-\uFF60\uFFE0-\uFFE6\u20E3\uFE0F]/u.test(
+        segment,
+      )
+        ? 2
+        : 1;
+  }
+
+  return width;
+}
+
+function padPublicationColumn(value: string, width: number): string {
+  return `${value}${" ".repeat(width - publicationDisplayWidth(value))}`;
+}
+
+function publicationIssueUrl(value: string | undefined): string | undefined {
+  if (
+    value === undefined ||
+    value !== value.trim() ||
+    value !== stripVTControlCharacters(value) ||
+    /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/u.test(value) ||
+    safeErrorMessage(value) !== value
+  ) {
+    return undefined;
+  }
+
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return undefined;
+  }
+
+  if (
+    url.protocol !== "https:" ||
+    (url.hostname !== "linear.app" && !url.hostname.endsWith(".linear.app")) ||
+    url.username.length > 0 ||
+    url.password.length > 0 ||
+    url.search.length > 0 ||
+    url.hash.length > 0
+  ) {
+    return undefined;
+  }
+
+  return value;
+}
+
+function renderPublicationSummary(
+  result: PublishScanResult,
+  color: boolean,
+): string {
+  const created = result.created.length;
+  const failed = result.failed.length;
+  const marker = failed === 0 ? "✓" : "!";
+  const title =
+    failed === 0
+      ? "Linear publication complete"
+      : "Linear publication completed with failures";
+  const heading = color
+    ? `\u001B[${failed === 0 ? "32" : "33"}m${marker}\u001B[39m \u001B[1m${title}\u001B[22m`
+    : `${marker} ${title}`;
+  const lines = [heading, ""];
+
+  for (const issue of result.created.slice(0, 5)) {
+    const identifier =
+      stripVTControlCharacters(safeErrorMessage(issue.issueIdentifier))
+        .replaceAll(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/gu, " ")
+        .replace(/\s+/gu, " ")
+        .trim() || "Unknown Linear issue";
+    const url = publicationIssueUrl(issue.url);
+    lines.push(`  ${identifier}${url === undefined ? "" : `  ${url}`}`);
+  }
+  if (created > 5) lines.push("  ...");
+  if (created > 0) lines.push("");
+
+  lines.push(
+    `${created} total issue${created === 1 ? "" : "s"} created`,
+    `${failed} total issue${failed === 1 ? "" : "s"} failed`,
+  );
+  return `${lines.join("\n")}\n`;
+}
+
+class PublicationProgressPresenter {
+  readonly #stream: Writable;
+  readonly #dependencies: CliDependencies;
+  readonly #repository: string;
+  readonly #seenActivities = new Set<string>();
+  #dashboard: ScanDashboard | null = null;
+
+  public constructor(
+    stream: Writable,
+    dependencies: CliDependencies,
+    repository: string,
+  ) {
+    this.#stream = stream;
+    this.#dependencies = dependencies;
+    this.#repository = repository;
+  }
+
+  public start(): void {
+    if (
+      this.#stream.isTTY !== true ||
+      this.#dependencies.environment["CI"] !== undefined ||
+      this.#dependencies.environment["TERM"] === "dumb"
+    ) {
+      return;
+    }
+
+    const dashboard = new ScanDashboard(this.#stream, {
+      repository: this.#repository,
+      presentation: "publication",
+      clock: this.#dependencies,
+      color: this.#dependencies.environment["NO_COLOR"] === undefined,
+      sanitize: safeErrorMessage,
+    });
+    dashboard.setStage("Connecting to Linear");
+    try {
+      dashboard.start();
+      this.#dashboard = dashboard;
+    } catch {
+      try {
+        dashboard.stop();
+      } catch {}
+      this.#dashboard = null;
+    }
+  }
+
+  public stop(): void {
+    try {
+      this.#dashboard?.stop();
+    } catch {}
+    this.#dashboard = null;
+  }
+
+  public observe(event: PublishScanProgress): void {
+    if (event.type === "started") {
+      if (this.#dashboard !== null) {
+        this.#dashboard.setPublicationProgress(0, event.total);
+        this.#dashboard.setStage(`Publishing findings · 0/${event.total}`);
+      } else {
+        this.#write(
+          `Publishing ${event.total} finding${event.total === 1 ? "" : "s"} to Linear.`,
+        );
+      }
+      return;
+    }
+
+    if (event.type === "codex_event") {
+      if (
+        typeof event.event !== "object" ||
+        event.event === null ||
+        Array.isArray(event.event)
+      ) {
+        return;
+      }
+      for (const activity of scanActivitiesFromEvent(
+        event.event as Record<string, unknown>,
+        this.#repository,
+      )) {
+        const item = (event.event as Record<string, unknown>)["item"];
+        const tool =
+          typeof item === "object" && item !== null && !Array.isArray(item)
+            ? (item as Record<string, unknown>)["tool"]
+            : undefined;
+        const hidesShellCommand =
+          activity.kind === "command" ||
+          (activity.kind === "tool" &&
+            typeof tool === "string" &&
+            /^(?:exec|exec_command|shell_command|shell|apply_patch)$/u.test(
+              tool,
+            ));
+        const visibleActivity = hidesShellCommand
+          ? {
+              ...activity,
+              description: "Saving Linear publication results",
+              paths: [],
+            }
+          : activity;
+        if (this.#dashboard !== null) {
+          this.#dashboard.record(visibleActivity);
+          continue;
+        }
+        const key = `${visibleActivity.id}\0${visibleActivity.description}`;
+        if (this.#seenActivities.has(key)) continue;
+        this.#seenActivities.add(key);
+        const label =
+          visibleActivity.kind === "reasoning"
+            ? "Codex"
+            : visibleActivity.kind === "message"
+              ? "Codex"
+              : "Tool";
+        this.#write(`${label}: ${visibleActivity.description}`, true);
+      }
+      return;
+    }
+
+    if (event.type === "issue_completed") {
+      const detail =
+        event.error === undefined
+          ? `Created ${event.issueIdentifier ?? event.findingId}`
+          : `Failed ${event.findingId}: ${event.error}`;
+      if (this.#dashboard !== null) {
+        this.#dashboard.setPublicationProgress(event.completed, event.total);
+        this.#dashboard.setStage(
+          `Publishing findings · ${event.completed}/${event.total}`,
+        );
+        this.#dashboard.note(detail);
+      } else {
+        this.#write(`[${event.completed}/${event.total}] ${detail}`, true);
+      }
+      return;
+    }
+
+    const summary = `Published ${event.created}/${event.total} finding${event.total === 1 ? "" : "s"}${event.failed === 0 ? "" : ` (${event.failed} failed)`}.`;
+    if (this.#dashboard !== null) {
+      this.#dashboard.setPublicationProgress(
+        event.created + event.failed,
+        event.total,
+      );
+      this.#dashboard.setStage(summary);
+    } else {
+      this.#write(summary);
+    }
+  }
+
+  #write(message: string, compact = false): void {
+    const sanitized = diagnosticValue(safeErrorMessage(message));
+    if (!compact) {
+      this.#stream.write(`${sanitized}\n`);
+      return;
+    }
+    const width = Math.max(24, Math.min(this.#stream.columns ?? 120, 160));
+    const visible =
+      sanitized.length <= width
+        ? sanitized
+        : `${sanitized.slice(0, width - 1)}…`;
+    this.#stream.write(`${visible}\n`);
+  }
 }
 
 function effortOption() {
@@ -798,6 +1079,7 @@ export async function main(
   let frameworkExit: number | undefined;
   let frameworkOutput = "";
   let renderedHistory: string | undefined;
+  let renderedPublication: string | undefined;
   const history = async (
     args: readonly string[],
     select: (value: JsonObject) => JsonObject | Promise<JsonObject> = (value) =>
@@ -1267,10 +1549,15 @@ export async function main(
         .describe("Preview the findings without creating Linear issues."),
     }),
     output: z.record(z.string(), z.unknown()).optional(),
-    async run({ args, options }) {
+    async run({ args, format, formatExplicit, options }) {
       const controller = new AbortController();
-      const onInterrupt = (): void => controller.abort("SIGINT");
-      const onTerminate = (): void => controller.abort("SIGTERM");
+      let presentation: PublicationProgressPresenter | undefined;
+      const cancel = (signal: SignalName): void => {
+        presentation?.stop();
+        controller.abort(signal);
+      };
+      const onInterrupt = (): void => cancel("SIGINT");
+      const onTerminate = (): void => cancel("SIGTERM");
       let observingSignals = false;
       try {
         const teamId =
@@ -1291,6 +1578,8 @@ export async function main(
           undefined;
 
         let scanDir = args.scanDir;
+        let publicationRepository =
+          scanDir === undefined ? "scan" : basename(scanDir);
         if (scanDir === undefined) {
           const prompt =
             dependencies.publishPrompt ??
@@ -1333,7 +1622,13 @@ export async function main(
               }),
             )
           ).filter((scan): scan is JsonObject => scan !== undefined);
-          const choices = scans.flatMap((scan) => {
+          const now = dependencies.now();
+          const emphasizeRepository =
+            errorOutput.isTTY === true &&
+            dependencies.environment["NO_COLOR"] === undefined &&
+            dependencies.environment["TERM"] !== "dumb";
+          const repositories = new Map<string, string>();
+          const rows = scans.flatMap((scan) => {
             if (!isJsonObject(scan)) return [];
             const progress = scan["progress"];
             const scanId = scan["scanId"];
@@ -1351,12 +1646,16 @@ export async function main(
             }
             const targetSummary = scan["targetSummary"];
             const targetPath = scan["targetPath"];
-            const repository =
+            const repository = stripVTControlCharacters(
               typeof targetSummary === "string" && targetSummary.trim()
                 ? targetSummary.trim()
                 : typeof targetPath === "string" && targetPath.trim()
                   ? basename(targetPath)
-                  : "unknown repository";
+                  : "unknown repository",
+            )
+              .replaceAll(/[\u0000-\u001F\u007F-\u009F]/gu, " ")
+              .replace(/\s+/gu, " ")
+              .trim();
             const completedAt = scan["completedAt"];
             const startedAt = scan["startedAt"];
             const updatedAt = scan["updatedAt"];
@@ -1373,39 +1672,104 @@ export async function main(
               typeof findingCount === "number"
                 ? `${findingCount} finding${findingCount === 1 ? "" : "s"}`
                 : "unknown findings";
+            const shortScanId = `...${stripVTControlCharacters(scanId)
+              .replaceAll(/[\u0000-\u001F\u007F-\u009F]/gu, " ")
+              .replace(/\s+/gu, " ")
+              .slice(-6)}`;
+            repositories.set(directory, repository);
             return [
               {
-                label: `${repository} · ${scanId} · ${timestamp} · ${findings} · COMPLETE`,
+                repository,
+                findings,
+                age: publicationScanAge(timestamp, now),
+                scanId: shortScanId,
                 value: directory,
               },
             ];
           });
-          if (choices.length === 0) {
+          if (rows.length === 0) {
             throw new CodexSecurityError(
               "No completed Codex Security scans are available to publish.",
             );
           }
+          const repositoryWidth = Math.max(
+            publicationDisplayWidth("REPOSITORY"),
+            ...rows.map(({ repository }) =>
+              publicationDisplayWidth(repository),
+            ),
+          );
+          const findingsWidth = Math.max(
+            publicationDisplayWidth("FINDINGS"),
+            ...rows.map(({ findings }) => publicationDisplayWidth(findings)),
+          );
+          const ageWidth = Math.max(
+            publicationDisplayWidth("AGE"),
+            ...rows.map(({ age }) => publicationDisplayWidth(age)),
+          );
+          const header = [
+            padPublicationColumn("REPOSITORY", repositoryWidth),
+            padPublicationColumn("FINDINGS", findingsWidth),
+            padPublicationColumn("AGE", ageWidth),
+            "SCAN ID",
+          ].join("  ");
+          const choices = rows.map((row) => {
+            const repository = emphasizeRepository
+              ? `\u001B[1m${row.repository}\u001B[22m`
+              : row.repository;
+
+            return {
+              label: [
+                padPublicationColumn(repository, repositoryWidth),
+                padPublicationColumn(row.findings, findingsWidth),
+                padPublicationColumn(row.age, ageWidth),
+                row.scanId,
+              ].join("  "),
+              short: `${repository} · ${row.scanId}`,
+              value: row.value,
+            };
+          });
           scanDir = await prompt.select(
             "Which completed scan would you like to publish?",
             choices,
+            { header },
           );
+          publicationRepository =
+            repositories.get(scanDir) ?? basename(scanDir);
         }
 
+        const progress = new PublicationProgressPresenter(
+          errorOutput,
+          dependencies,
+          publicationRepository,
+        );
+        presentation = progress;
         if (!options.dryRun) {
           dependencies.addSignalListener("SIGINT", onInterrupt);
           dependencies.addSignalListener("SIGTERM", onTerminate);
           observingSignals = true;
+          progress.start();
         }
-        const result = await (dependencies.publishScan ?? publishScan)(
-          resolve(dependencies.currentDirectory(), scanDir),
-          {
-            destination: options.to,
-            teamId,
-            ...(projectId === undefined ? {} : { projectId }),
-            dryRun: options.dryRun,
-            ...(options.dryRun ? {} : { signal: controller.signal }),
-          },
-        );
+        let result;
+        try {
+          result = await (dependencies.publishScan ?? publishScan)(
+            resolve(dependencies.currentDirectory(), scanDir),
+            {
+              destination: options.to,
+              teamId,
+              ...(projectId === undefined ? {} : { projectId }),
+              dryRun: options.dryRun,
+              ...(options.dryRun
+                ? {}
+                : {
+                    signal: controller.signal,
+                    onProgress: (event: PublishScanProgress) =>
+                      progress.observe(event),
+                  }),
+            },
+          );
+        } finally {
+          progress.stop();
+        }
         controller.signal.throwIfAborted();
         if (result.failed.length > 0) exitCode = 2;
         if ("warnings" in result && Array.isArray(result.warnings)) {
@@ -1415,6 +1779,19 @@ export async function main(
               `codex-security: ${diagnosticValue(safeErrorMessage(warning))}\n`,
             );
           }
+        }
+        if (
+          format === "toon" &&
+          !formatExplicit &&
+          !options.dryRun &&
+          !argv.some((argument) => SCAN_HISTORY_OUTPUT_OPTION.test(argument))
+        ) {
+          renderedPublication = renderPublicationSummary(
+            result,
+            output.isTTY === true &&
+              dependencies.environment["NO_COLOR"] === undefined &&
+              dependencies.environment["TERM"] !== "dumb",
+          );
         }
         return { ...result };
       } catch (error) {
@@ -2267,7 +2644,10 @@ export async function main(
   }
   if (frameworkOutput.length === 0) return exitCode;
   try {
-    await writeCliOutput(output, renderedHistory ?? frameworkOutput);
+    await writeCliOutput(
+      output,
+      renderedPublication ?? renderedHistory ?? frameworkOutput,
+    );
     return exitCode;
   } catch (error) {
     errorOutput.write(`codex-security: ${errorMessage(error)}\n`);

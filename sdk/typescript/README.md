@@ -561,7 +561,8 @@ Add `--project PROJECT_ID` to place the issues in a Linear project. Without a
 project, issues are created directly in the selected team.
 
 To choose from all completed scans saved in your local scan history, omit the
-scan directory:
+scan directory. The selector highlights each repository and shows its finding
+count, relative run time, and abbreviated scan ID:
 
 ```bash
 npx @openai/codex-security publish scan \
@@ -573,6 +574,9 @@ Destination flags take precedence over `CODEX_SECURITY_LINEAR_TEAM` and the
 optional `CODEX_SECURITY_LINEAR_PROJECT`. Use `--dry-run` to preview the issue
 titles without creating them, or `--json` to return structured publication
 results.
+Interactive publication shows a full-screen activity view with live Codex
+output and issue-creation progress. Other terminals receive plain progress on
+stderr, so `--json` output remains machine-readable.
 
 Publishing starts Codex with your existing Codex configuration and connected
 Linear app. Sign in to Codex and connect Linear before publishing. The command
@@ -603,6 +607,13 @@ import { publishScan } from "@openai/codex-security";
 const publication = await publishScan("/path/to/completed-scan", {
   destination: "linear",
   teamId: "TEAM_ID",
+  onProgress: (progress) => {
+    if (progress.type === "issue_completed") {
+      console.error(
+        `Processed ${progress.completed} of ${progress.total} findings.`,
+      );
+    }
+  },
 });
 
 console.log(publication.scanId);
